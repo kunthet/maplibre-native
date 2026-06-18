@@ -300,29 +300,23 @@ GLFWView::GLFWView(bool fullscreen_,
     glfwSetScrollCallback(window, onScroll);
     glfwSetKeyCallback(window, onKey);
     glfwSetWindowFocusCallback(window, onWindowFocus);
+#if defined(GLFW_RAW_MOUSE_MOTION)
+    if (glfwRawMouseMotionSupported()) {
+        glfwSetInputMode(window, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
+    }
+#endif
 #if defined(__APPLE__) && defined(MLN_RENDER_BACKEND_VULKAN)
     glfwSetWindowRefreshCallback(window, onWindowRefresh);
 #endif
 
-    // "... applications will typically want to set the swap interval to one"
-    // https://www.glfw.org/docs/latest/quick.html#quick_swap_buffers
-
-#if defined(MLN_RENDER_BACKEND_OPENGL)
-    glfwSwapInterval(1);
-#endif
-
     glfwGetWindowSize(window, &width, &height);
 
-    bool capFrameRate = !benchmark; // disable VSync in benchmark mode
+    // Uncapped swap for lower input latency; vsync is re-enabled when idle if preferVSync.
+    const bool capFrameRate = false;
+    preferVSync = false;
     backend = GLFWBackend::Create(window, capFrameRate);
 
-#if defined(__APPLE__) && !defined(MLN_RENDER_BACKEND_VULKAN)
-    int fbW, fbH;
-    glfwGetFramebufferSize(window, &fbW, &fbH);
-    backend->setSize({static_cast<uint32_t>(fbW), static_cast<uint32_t>(fbH)});
-#endif
-
-    pixelRatio = static_cast<float>(backend->getSize().width) / width;
+    syncViewportFromWindow();
 
     glfwMakeContextCurrent(nullptr);
 
@@ -401,6 +395,7 @@ void GLFWView::setMap(mbgl::Map *map_) {
     MLN_TRACE_FUNC();
 
     map = map_;
+    syncViewportFromWindow();
     map->addAnnotationImage(makeImage("default_marker", 22, 22, 1));
 }
 
@@ -575,6 +570,9 @@ void GLFWView::onKey(GLFWwindow *window, int key, int /*scancode*/, int action, 
                 view->toggleCustomSource();
                 break;
             case GLFW_KEY_F: {
+                view->prepareForMapContentChange();
+                view->clearFeatureHoverState();
+
                 using namespace mbgl;
                 using namespace mbgl::style;
                 using namespace mbgl::style::expression::dsl;
@@ -601,10 +599,11 @@ void GLFWView::onKey(GLFWwindow *window, int key, int /*scancode*/, int action, 
                     fillLayer->setFillOpacity(PropertyExpression<float>(
                         createExpression(R"(["case", ["boolean", ["feature-state", "hover"], false], 1, 0.5])")));
                     style.addLayer(std::move(fillLayer));
+                } else if (layer->getVisibility() == mbgl::style::VisibilityType::Visible) {
+                    layer->setVisibility(mbgl::style::VisibilityType::None);
+                    view->clearFeatureHoverState();
                 } else {
-                    layer->setVisibility(layer->getVisibility() == mbgl::style::VisibilityType::Visible
-                                             ? mbgl::style::VisibilityType::None
-                                             : mbgl::style::VisibilityType::Visible);
+                    layer->setVisibility(mbgl::style::VisibilityType::Visible);
                 }
 
                 layer = style.getLayer("state-borders");
@@ -614,10 +613,10 @@ void GLFWView::onKey(GLFWwindow *window, int key, int /*scancode*/, int action, 
                     borderLayer->setLineWidth(PropertyExpression<float>(
                         createExpression(R"(["case", ["boolean", ["feature-state", "hover"], false], 2, 1])")));
                     style.addLayer(std::move(borderLayer));
+                } else if (layer->getVisibility() == mbgl::style::VisibilityType::Visible) {
+                    layer->setVisibility(mbgl::style::VisibilityType::None);
                 } else {
-                    layer->setVisibility(layer->getVisibility() == mbgl::style::VisibilityType::Visible
-                                             ? mbgl::style::VisibilityType::None
-                                             : mbgl::style::VisibilityType::Visible);
+                    layer->setVisibility(mbgl::style::VisibilityType::Visible);
                 }
             } break;
             case GLFW_KEY_F1: {
@@ -673,42 +672,54 @@ void GLFWView::onKey(GLFWwindow *window, int key, int /*scancode*/, int action, 
         }
     }
 
-    if (action == GLFW_RELEASE || action == GLFW_REPEAT) {
+    if (action == GLFW_RELEASE) {
         switch (key) {
             case GLFW_KEY_W:
+                view->prepareForMapContentChange();
                 view->popAnnotation();
                 break;
             case GLFW_KEY_1:
+                view->prepareForMapContentChange();
                 view->addRandomPointAnnotations(1);
                 break;
             case GLFW_KEY_2:
+                view->prepareForMapContentChange();
                 view->addRandomPointAnnotations(10);
                 break;
             case GLFW_KEY_3:
+                view->prepareForMapContentChange();
                 view->addRandomPointAnnotations(100);
                 break;
             case GLFW_KEY_4:
+                view->prepareForMapContentChange();
                 view->addRandomPointAnnotations(1000);
                 break;
             case GLFW_KEY_5:
+                view->prepareForMapContentChange();
                 view->addRandomPointAnnotations(10000);
                 break;
             case GLFW_KEY_6:
+                view->prepareForMapContentChange();
                 view->addRandomPointAnnotations(100000);
                 break;
             case GLFW_KEY_7:
+                view->prepareForMapContentChange();
                 view->addRandomShapeAnnotations(1);
                 break;
             case GLFW_KEY_8:
+                view->prepareForMapContentChange();
                 view->addRandomShapeAnnotations(10);
                 break;
             case GLFW_KEY_9:
+                view->prepareForMapContentChange();
                 view->addRandomShapeAnnotations(100);
                 break;
             case GLFW_KEY_0:
+                view->prepareForMapContentChange();
                 view->addRandomShapeAnnotations(1000);
                 break;
             case GLFW_KEY_M:
+                view->prepareForMapContentChange();
                 view->addAnimatedAnnotation();
                 break;
         }
@@ -841,6 +852,10 @@ void GLFWView::addRandomCustomPointAnnotations(int count) {
 
 void GLFWView::addRandomPointAnnotations(int count) {
     MLN_TRACE_FUNC();
+
+    if (!map || count <= 0) {
+        return;
+    }
 
     for (int i = 0; i < count; ++i) {
         annotationIDs.push_back(map->addAnnotation(mbgl::SymbolAnnotation{makeRandomPoint(), "default_marker"}));
@@ -1017,6 +1032,7 @@ void GLFWView::onScroll(GLFWwindow *window, double /*xOffset*/, double yOffset) 
     }
 
     view->map->scaleBy(scale, mbgl::ScreenCoordinate{view->lastX, view->lastY});
+    view->extendScrollGestureFreeze();
 #if defined(MLN_RENDER_BACKEND_OPENGL) && !defined(MBGL_LAYER_CUSTOM_DISABLE_ALL)
     if (view->puck && view->puckFollowsCameraCenter) {
         mbgl::LatLng mapCenter = view->map->getCameraOptions().center.value();
@@ -1025,31 +1041,119 @@ void GLFWView::onScroll(GLFWwindow *window, double /*xOffset*/, double yOffset) 
 #endif
 }
 
+void GLFWView::prepareForMapContentChange() {
+    releasePanSnapshot();
+    wake();
+}
+
+void GLFWView::clearFeatureHoverState() {
+    if (!rendererFrontend || !featureID) {
+        featureID = std::nullopt;
+        return;
+    }
+
+    mbgl::FeatureState cleared;
+    cleared["hover"] = false;
+    rendererFrontend->getRenderer()->setFeatureState("states", {}, *featureID, cleared);
+    featureID = std::nullopt;
+}
+
+void GLFWView::capturePanSnapshot(const double mouseX, const double mouseY) {
+    panSnapshotOriginX = mouseX;
+    panSnapshotOriginY = mouseY;
+    lastX = mouseX;
+    lastY = mouseY;
+    panSnapshotActive = false;
+
+    if (!backend || !rendererFrontend) {
+        return;
+    }
+
+    mbgl::gfx::BackendScope scope{backend->getRendererBackend(), mbgl::gfx::BackendScope::ScopeType::Implicit};
+
+    backend->releasePanSnapshot();
+
+    // Grab the current map image before gesture-freeze starts. If a frame is
+    // pending, render once and capture from the back buffer inside swap().
+    if (dirty) {
+        syncViewportFromWindow();
+        backend->requestPanSnapshotCaptureOnNextSwap();
+        rendererFrontend->render();
+        dirty = false;
+        panSnapshotActive = backend->hasPanSnapshot();
+    } else {
+        panSnapshotActive = backend->captureDisplayedPanSnapshot();
+    }
+}
+
+void GLFWView::releasePanSnapshot() {
+    panSnapshotActive = false;
+    if (!backend) {
+        return;
+    }
+
+    mbgl::gfx::BackendScope scope{backend->getRendererBackend(), mbgl::gfx::BackendScope::ScopeType::Implicit};
+    backend->releasePanSnapshot();
+}
+
+bool GLFWView::renderPanSnapshot() {
+    if (!panSnapshotActive || !tracking || !backend) {
+        return false;
+    }
+
+    // Window Y grows downward; OpenGL framebuffer Y grows upward — negate Y so the
+    // snapshot follows the cursor (grab-and-drag), matching moveBy semantics.
+    const float offsetX = static_cast<float>((lastX - panSnapshotOriginX) * pixelRatio);
+    const float offsetY = static_cast<float>((panSnapshotOriginY - lastY) * pixelRatio);
+    mbgl::gfx::BackendScope scope{backend->getRendererBackend(), mbgl::gfx::BackendScope::ScopeType::Implicit};
+    return backend->drawPanSnapshot(offsetX, offsetY);
+}
+
+void GLFWView::syncViewportFromWindow() {
+    if (!window || !backend) {
+        return;
+    }
+
+    int winW = 0;
+    int winH = 0;
+    glfwGetWindowSize(window, &winW, &winH);
+    if (winW > 0 && winH > 0) {
+        width = winW;
+        height = winH;
+    }
+
+    int fbW = 0;
+    int fbH = 0;
+    glfwGetFramebufferSize(window, &fbW, &fbH);
+    if (fbW <= 0 || fbH <= 0) {
+        return;
+    }
+
+    backend->setSize({static_cast<uint32_t>(fbW), static_cast<uint32_t>(fbH)});
+
+    const float newPixelRatio = static_cast<float>(fbW) / static_cast<float>(width);
+    pixelRatio = newPixelRatio;
+
+    if (map) {
+        map->setSize({static_cast<uint32_t>(width), static_cast<uint32_t>(height)});
+        map->setPixelRatio(newPixelRatio);
+    }
+}
+
 void GLFWView::onWindowResize(GLFWwindow *window, int width, int height) {
     MLN_TRACE_FUNC();
 
     auto *view = reinterpret_cast<GLFWView *>(glfwGetWindowUserPointer(window));
     view->width = width;
     view->height = height;
-    view->map->setSize({static_cast<uint32_t>(view->width), static_cast<uint32_t>(view->height)});
-
-#ifdef __APPLE__
-    int fbW, fbH;
-    glfwGetFramebufferSize(window, &fbW, &fbH);
-    view->backend->setSize({static_cast<uint32_t>(fbW), static_cast<uint32_t>(fbH)});
-#endif
+    view->syncViewportFromWindow();
 }
 
-void GLFWView::onFramebufferResize(GLFWwindow *window, int width, int height) {
+void GLFWView::onFramebufferResize(GLFWwindow *window, int /*width*/, int /*height*/) {
     MLN_TRACE_FUNC();
 
     auto *view = reinterpret_cast<GLFWView *>(glfwGetWindowUserPointer(window));
-    view->backend->setSize({static_cast<uint32_t>(width), static_cast<uint32_t>(height)});
-
-    // This is only triggered when the framebuffer is resized, but not the
-    // window. It can happen when you move the window between screens with a
-    // different pixel ratio. We are forcing a repaint my invalidating the view,
-    // which triggers a rerender with the new framebuffer dimensions.
+    view->syncViewportFromWindow();
     view->invalidate();
 
 #if defined(__APPLE__) && defined(MLN_RENDER_BACKEND_VULKAN)
@@ -1063,6 +1167,140 @@ void GLFWView::onFramebufferResize(GLFWwindow *window, int width, int height) {
 #endif
 }
 
+void GLFWView::setInteracting(bool active) {
+    if (mouseGestureActive == active) {
+        return;
+    }
+    mouseGestureActive = active;
+    syncGestureFreezeState();
+}
+
+void GLFWView::extendScrollGestureFreeze() {
+    const bool wasFrozen = interacting;
+    scrollGestureFrozen = true;
+    lastInteractionTime = glfwGetTime();
+
+    scrollFreezeTimer.stop();
+    scrollFreezeTimer.start(mbgl::Milliseconds(500), mbgl::Duration::zero(), [this] {
+        scrollFreezeTimer.stop();
+        scrollGestureFrozen = false;
+        syncGestureFreezeState();
+    });
+
+    syncGestureFreezeState();
+    if (wasFrozen) {
+        wake();
+    }
+}
+
+void GLFWView::syncGestureFreezeState() {
+    const bool shouldFreeze = mouseGestureActive || scrollGestureFrozen;
+    if (interacting == shouldFreeze) {
+        return;
+    }
+    interacting = shouldFreeze;
+    lastInteractionTime = glfwGetTime();
+
+    if (map) {
+        if (shouldFreeze) {
+            savedPrefetchZoomDelta = map->getPrefetchZoomDelta();
+            map->setPrefetchZoomDelta(0);
+            savedTileLodZoomShift = map->getTileLodZoomShift();
+            map->setTileLodZoomShift(savedTileLodZoomShift - 0.25);
+            map->setGestureInProgress(true);
+        } else {
+            map->setPrefetchZoomDelta(savedPrefetchZoomDelta);
+            map->setTileLodZoomShift(savedTileLodZoomShift);
+            map->setGestureInProgress(false);
+            map->triggerRepaint();
+        }
+    }
+
+    if (backend) {
+        backend->setVSyncEnabled(shouldFreeze ? false : preferVSync);
+    }
+
+    wake();
+    restartFrameTick();
+}
+
+void GLFWView::wake() {
+    dirty = true;
+    glfwPostEmptyEvent();
+}
+
+void GLFWView::restartFrameTick() {
+    frameTick.stop();
+    const auto interval = interacting || benchmark ? mbgl::Milliseconds(1000 / 120) : mbgl::Milliseconds(1000 / 60);
+    frameTick.start(mbgl::Duration::zero(), interval, [this] { processEventsAndRender(); });
+}
+
+void GLFWView::processEventsAndRender() {
+    if (glfwWindowShouldClose(window)) {
+        runLoop.stop();
+        return;
+    }
+
+    glfwPollEvents();
+
+    if (dirty) {
+        constexpr double minInteractionFrameInterval = 1.0 / 120.0;
+        const double now = glfwGetTime();
+        const bool panSnapshotFrame = panSnapshotActive && tracking;
+        if (interacting && !panSnapshotFrame && (now - lastRenderTime) < minInteractionFrameInterval) {
+            return;
+        }
+        render();
+        lastRenderTime = now;
+    }
+
+#ifndef __APPLE__
+    runLoop.updateTime();
+#endif
+}
+
+void GLFWView::updateHoverFeatureState() {
+    if (!map || !rendererFrontend || panSnapshotActive || isInteracting()) {
+        return;
+    }
+
+    auto& style = map->getStyle();
+    const auto* layer = style.getLayer("state-fills");
+    if (!layer || layer->getVisibility() != mbgl::style::VisibilityType::Visible || !style.getSource("states")) {
+        clearFeatureHoverState();
+        return;
+    }
+
+    const mbgl::ScreenCoordinate screenCoordinate{lastX, lastY};
+    const mbgl::RenderedQueryOptions queryOptions({{{"state-fills"}}, {}});
+    auto result = rendererFrontend->getRenderer()->queryRenderedFeatures(screenCoordinate, queryOptions);
+    using namespace mbgl;
+    FeatureState newState;
+
+    if (!result.empty()) {
+        FeatureIdentifier id = result[0].id;
+        std::optional<std::string> idStr = featureIDtoString(id);
+
+        if (idStr) {
+            if (featureID && (*featureID != *idStr)) {
+                newState["hover"] = false;
+                rendererFrontend->getRenderer()->setFeatureState("states", {}, *featureID, newState);
+                featureID = std::nullopt;
+            }
+
+            if (!featureID) {
+                newState["hover"] = true;
+                featureID = featureIDtoString(id);
+                rendererFrontend->getRenderer()->setFeatureState("states", {}, *featureID, newState);
+            }
+        }
+    } else if (featureID) {
+        newState["hover"] = false;
+        rendererFrontend->getRenderer()->setFeatureState("states", {}, *featureID, newState);
+        featureID = std::nullopt;
+    }
+}
+
 void GLFWView::onMouseClick(GLFWwindow *window, int button, int action, int modifiers) {
     MLN_TRACE_FUNC();
 
@@ -1070,15 +1308,25 @@ void GLFWView::onMouseClick(GLFWwindow *window, int button, int action, int modi
 
     if (button == GLFW_MOUSE_BUTTON_RIGHT || (button == GLFW_MOUSE_BUTTON_LEFT && modifiers & GLFW_MOD_CONTROL)) {
         view->rotating = action == GLFW_PRESS;
-        view->map->setGestureInProgress(view->rotating);
+        view->setInteracting(view->rotating || view->tracking || view->pitching);
     } else if (button == GLFW_MOUSE_BUTTON_LEFT && (modifiers & GLFW_MOD_SHIFT)) {
         view->pitching = action == GLFW_PRESS;
-        view->map->setGestureInProgress(view->pitching);
+        view->setInteracting(view->rotating || view->tracking || view->pitching);
     } else if (button == GLFW_MOUSE_BUTTON_LEFT) {
-        view->tracking = action == GLFW_PRESS;
-        view->map->setGestureInProgress(view->tracking);
+        if (action == GLFW_PRESS && !(modifiers & (GLFW_MOD_CONTROL | GLFW_MOD_SHIFT))) {
+            double mx = 0;
+            double my = 0;
+            glfwGetCursorPos(window, &mx, &my);
+            // Capture the displayed map before gesture-freeze; then start tracking.
+            view->capturePanSnapshot(mx, my);
+            view->tracking = true;
+            view->setInteracting(view->rotating || view->tracking || view->pitching);
+        } else if (action == GLFW_RELEASE) {
+            view->tracking = false;
+            view->releasePanSnapshot();
+            view->setInteracting(view->rotating || view->tracking || view->pitching);
+            view->updateHoverFeatureState();
 
-        if (action == GLFW_RELEASE) {
             double now = glfwGetTime();
             if (now - view->lastClick < 0.4 /* ms */) {
                 if (modifiers & GLFW_MOD_SHIFT) {
@@ -1103,16 +1351,21 @@ void GLFWView::onMouseMove(GLFWwindow *window, double x, double y) {
     if (view->tracking) {
         const double dx = x - view->lastX;
         const double dy = y - view->lastY;
-        if (dx || dy) {
+        if ((dx || dy) && view->map) {
             view->map->moveBy(mbgl::ScreenCoordinate{dx, dy});
+            view->wake();
         }
     } else if (view->rotating) {
         view->map->rotateBy({view->lastX, view->lastY}, {x, y});
+        view->wake();
     } else if (view->pitching) {
         const double dy = y - view->lastY;
         if (dy) {
             view->map->pitchBy(dy / 2);
+            view->wake();
         }
+    } else {
+        view->updateHoverFeatureState();
     }
     view->lastX = x;
     view->lastY = y;
@@ -1122,48 +1375,16 @@ void GLFWView::onMouseMove(GLFWwindow *window, double x, double y) {
         view->puck->setLocation(toArray(mapCenter));
     }
 #endif
-    auto &style = view->map->getStyle();
-    if (style.getLayer("state-fills")) {
-        auto screenCoordinate = mbgl::ScreenCoordinate{view->lastX, view->lastY};
-        const mbgl::RenderedQueryOptions queryOptions({{{"state-fills"}}, {}});
-        auto result = view->rendererFrontend->getRenderer()->queryRenderedFeatures(screenCoordinate, queryOptions);
-        using namespace mbgl;
-        FeatureState newState;
-
-        if (!result.empty()) {
-            FeatureIdentifier id = result[0].id;
-            std::optional<std::string> idStr = featureIDtoString(id);
-
-            if (idStr) {
-                if (view->featureID && (*view->featureID != *idStr)) {
-                    newState["hover"] = false;
-                    view->rendererFrontend->getRenderer()->setFeatureState("states", {}, *view->featureID, newState);
-                    view->featureID = std::nullopt;
-                }
-
-                if (!view->featureID) {
-                    newState["hover"] = true;
-                    view->featureID = featureIDtoString(id);
-                    view->rendererFrontend->getRenderer()->setFeatureState("states", {}, *view->featureID, newState);
-                }
-            }
-        } else {
-            if (view->featureID) {
-                newState["hover"] = false;
-                view->rendererFrontend->getRenderer()->setFeatureState("states", {}, *view->featureID, newState);
-                view->featureID = std::nullopt;
-            }
-        }
-        view->invalidate();
-    }
 }
 
 void GLFWView::onWindowFocus(GLFWwindow *window, int focused) {
     MLN_TRACE_FUNC();
 
-    if (focused == GLFW_FALSE) { // Focus lost.
+    if (focused == GLFW_FALSE) {
         auto *view = reinterpret_cast<GLFWView *>(glfwGetWindowUserPointer(window));
-        view->rendererFrontend->getRenderer()->reduceMemoryUse();
+        if (glfwGetTime() - view->lastInteractionTime >= 5.0) {
+            view->rendererFrontend->getRenderer()->reduceMemoryUse();
+        }
     }
 }
 
@@ -1183,6 +1404,21 @@ void GLFWView::onWindowRefresh(GLFWwindow *window) {
 void GLFWView::render() {
     if (dirty && rendererFrontend) {
         MLN_TRACE_ZONE(ReRender);
+
+        syncViewportFromWindow();
+
+        if (panSnapshotActive && tracking && renderPanSnapshot()) {
+            dirty = false;
+            report(0.1f); // snapshot blit; wall time is not meaningful here
+            if (benchmark && interacting) {
+                invalidate();
+            }
+            return;
+        }
+
+        if (panSnapshotActive) {
+            releasePanSnapshot();
+        }
 
         dirty = false;
         const double started = glfwGetTime();
@@ -1204,7 +1440,7 @@ void GLFWView::render() {
         }
 
         report(static_cast<float>(1000 * (glfwGetTime() - started)));
-        if (benchmark) {
+        if (benchmark && interacting) {
             invalidate();
         }
     }
@@ -1213,38 +1449,20 @@ void GLFWView::render() {
 void GLFWView::run() {
     MLN_TRACE_FUNC();
 
-    auto callback = [&] {
-        MLN_TRACE_ZONE(GLFWView_runLoop_callback);
+    restartFrameTick();
 
-        {
-            MLN_TRACE_ZONE(glfwWindowShouldClose);
-            if (glfwWindowShouldClose(window)) {
-                runLoop.stop();
-                return;
-            }
+    maintenanceTick.start(mbgl::Seconds(180), mbgl::Seconds(180), [this] {
+        if (interacting) {
+            return;
         }
-
-        {
-            MLN_TRACE_ZONE(glfwPollEvents);
-            glfwPollEvents();
+        if (maintenanceCallback) {
+            maintenanceCallback();
         }
+        if (rendererFrontend && glfwGetTime() - lastInteractionTime >= 5.0) {
+            rendererFrontend->getRenderer()->reduceMemoryUse();
+        }
+    });
 
-        render();
-
-#ifndef __APPLE__
-        runLoop.updateTime();
-#endif
-    };
-
-    // Cap frame rate to 60hz if benchmark mode is disabled
-    auto tickDuration = mbgl::Milliseconds(1000 / 60);
-    if (benchmark) {
-        // frameTick.start internally uses libuv which uses milliseconds resolution
-        // tickDuration is set to 1ms in benchmark mode which limits FPS to 1000
-        // 1000 should more than enough for benchmarking purposes
-        tickDuration = mbgl::Milliseconds(1);
-    }
-    frameTick.start(mbgl::Duration::zero(), tickDuration, callback);
 #if defined(__APPLE__)
     while (!glfwWindowShouldClose(window)) runLoop.run();
 #else
@@ -1264,26 +1482,84 @@ void GLFWView::invalidate() {
     MLN_TRACE_FUNC();
 
     dirty = true;
-    glfwPostEmptyEvent();
+    if (!interacting) {
+        glfwPostEmptyEvent();
+    }
 }
 
 void GLFWView::report(float duration) {
+    if (!benchmark) {
+        return;
+    }
+
     frames++;
     frameTime += duration;
 
     const double currentTime = glfwGetTime();
     if (currentTime - lastReported >= 1) {
-        frameTime /= frames;
+        const float avgFrameTime = frames > 0 ? (frameTime / frames) : 0.f;
 
         std::ostringstream oss;
         oss.precision(2);
-        oss << "Frame time: " << std::fixed << frameTime << "ms (" << 1000 / frameTime << "fps)";
+        oss << std::fixed << "Frame wall: " << avgFrameTime << "ms";
+        if (avgFrameTime > 0.001f) {
+            oss << " (" << (1000.f / avgFrameTime) << "fps)";
+        } else {
+            oss << " (snapshot pan)";
+        }
+        if (benchmarkStatFrames > 0) {
+            oss << " | encode: " << (benchmarkEncodeTime / benchmarkStatFrames) * 1000.0 << "ms"
+                << " | gpu present: " << (benchmarkRenderTime / benchmarkStatFrames) * 1000.0 << "ms";
+        }
+        if (benchmarkGestureFrames > 0) {
+            oss << " | gesture gpu: " << (benchmarkGestureRenderTime / benchmarkGestureFrames) * 1000.0 << "ms"
+                << " (" << benchmarkGestureFrames << "f)";
+        }
+        if (benchmarkNonGestureFrames > 0) {
+            oss << " | fill-in gpu: " << (benchmarkNonGestureRenderTime / benchmarkNonGestureFrames) * 1000.0 << "ms"
+                << " (" << benchmarkNonGestureFrames << "f)";
+        }
+        if (lastFrameWasGesture) {
+            oss << " [gesture]";
+        }
         mbgl::Log::Info(mbgl::Event::Render, oss.str());
 
         frames = 0;
         frameTime = 0;
+        benchmarkStatFrames = 0;
+        benchmarkEncodeTime = 0;
+        benchmarkRenderTime = 0;
+        benchmarkGestureFrames = 0;
+        benchmarkGestureEncodeTime = 0;
+        benchmarkGestureRenderTime = 0;
+        benchmarkNonGestureFrames = 0;
+        benchmarkNonGestureEncodeTime = 0;
+        benchmarkNonGestureRenderTime = 0;
         lastReported = currentTime;
     }
+}
+
+void GLFWView::reportBenchmarkStats(const mbgl::gfx::RenderingStats& stats) {
+    if (!benchmark) {
+        return;
+    }
+    benchmarkStatFrames++;
+    benchmarkEncodeTime += stats.encodingTime;
+    benchmarkRenderTime += stats.renderingTime;
+    lastFrameWasGesture = interacting;
+    if (interacting) {
+        benchmarkGestureFrames++;
+        benchmarkGestureEncodeTime += stats.encodingTime;
+        benchmarkGestureRenderTime += stats.renderingTime;
+    } else {
+        benchmarkNonGestureFrames++;
+        benchmarkNonGestureEncodeTime += stats.encodingTime;
+        benchmarkNonGestureRenderTime += stats.renderingTime;
+    }
+}
+
+void GLFWView::onDidFinishRenderingFrame(const mbgl::MapObserver::RenderFrameStatus& status) {
+    reportBenchmarkStats(status.renderingStats);
 }
 
 void GLFWView::setChangeStyleCallback(std::function<void()> callback) {
@@ -1435,6 +1711,18 @@ void GLFWView::toggleLocationIndicatorLayer() {
         }
     }
 #endif
+}
+
+void GLFWView::onDidBecomeIdle() {
+    MLN_TRACE_FUNC();
+
+    if (interacting || glfwGetTime() - lastInteractionTime < 5.0) {
+        return;
+    }
+
+    if (rendererFrontend) {
+        rendererFrontend->getRenderer()->reduceMemoryUse();
+    }
 }
 
 using Nanoseconds = std::chrono::nanoseconds;

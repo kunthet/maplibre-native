@@ -191,21 +191,24 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
 
     const TransformState& state = renderTreeParameters.transformParams.state;
     const Size& size = staticData->backendSize;
+    const float framePixelRatio = updateParameters->pixelRatio;
     const EdgeInsets& frustumOffset = state.getFrustumOffset();
     const gfx::ScissorRect scissorRect = {
-        .x = static_cast<int32_t>(frustumOffset.left() * pixelRatio),
+        .x = static_cast<int32_t>(frustumOffset.left() * framePixelRatio),
 #if MLN_RENDER_BACKEND_OPENGL
-        .y = static_cast<int32_t>(frustumOffset.bottom() * pixelRatio),
+        .y = static_cast<int32_t>(frustumOffset.bottom() * framePixelRatio),
 #else
-        .y = static_cast<int32_t>(frustumOffset.top() * pixelRatio),
+        .y = static_cast<int32_t>(frustumOffset.top() * framePixelRatio),
 #endif
-        .width = size.width - static_cast<uint32_t>((frustumOffset.left() + frustumOffset.right()) * pixelRatio),
-        .height = size.height - static_cast<uint32_t>((frustumOffset.top() + frustumOffset.bottom()) * pixelRatio),
+        .width = size.width -
+                  static_cast<uint32_t>((frustumOffset.left() + frustumOffset.right()) * framePixelRatio),
+        .height = size.height -
+                  static_cast<uint32_t>((frustumOffset.top() + frustumOffset.bottom()) * framePixelRatio),
     };
 
     PaintParameters parameters{
         context,
-        pixelRatio,
+        framePixelRatio,
         backend,
         renderTreeParameters.light,
         renderTreeParameters.mapMode,
@@ -228,9 +231,11 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
     const auto& sourceRenderItems = renderTree.getSourceRenderItems();
 
     const auto& layerRenderItems = renderTree.getLayerRenderItemMap();
+    const bool transformOnly = renderTreeParameters.transformOnly;
 
     // - UPLOAD PASS -------------------------------------------------------------------------------
     // Uploads all required buffers and images before we do any actual rendering.
+    if (!transformOnly) {
     {
         const auto uploadPass = parameters.encoder->createUploadPass("upload",
                                                                      parameters.backend.getDefaultRenderable());
@@ -249,10 +254,11 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
         renderTree.getLineAtlas().upload(*uploadPass);
         renderTree.getPatternAtlas().upload(*uploadPass);
     }
+    }
 
     // - LAYER GROUP UPDATE ------------------------------------------------------------------------
     // Updates all layer groups and process changes
-    if (staticData && staticData->shaders) {
+    if (!transformOnly && staticData && staticData->shaders) {
         orchestrator.updateLayers(
             *staticData->shaders, context, renderTreeParameters.transformParams.state, updateParameters, renderTree);
     }
@@ -268,7 +274,9 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
 #endif
 
         // Update the debug layer groups
+        if (!transformOnly) {
         orchestrator.updateDebugLayerGroups(renderTree, parameters);
+        }
 
         // Tweakers are run in the upload pass so they can set up uniforms.
         parameters.currentLayer = 0;
@@ -282,6 +290,7 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
             parameters.currentLayer++;
         });
 
+        if (!transformOnly) {
         // Give the layers a chance to upload
         orchestrator.visitLayerGroups([&](LayerGroupBase& layerGroup) { layerGroup.upload(*uploadPass); });
 
@@ -290,6 +299,7 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
 
         // Upload the Debug layer group
         orchestrator.visitDebugLayerGroups([&](LayerGroupBase& layerGroup) { layerGroup.upload(*uploadPass); });
+        }
     }
 
     const Size atlasSize = parameters.patternAtlas.getPixelSize();

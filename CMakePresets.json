@@ -272,7 +272,10 @@
       "generator": "Ninja",
       "inherits": "windows",
       "cacheVariables": {
-        "MLN_WITH_OPENGL": "ON"
+        "MLN_WITH_OPENGL": "ON",
+        "MLN_WITH_GLFW": "ON",
+        "MLN_USE_BUILTIN_ICU": "ON",
+        "CMAKE_BUILD_TYPE": "Release"
       }
     },
     {

@@ -1,8 +1,10 @@
 #include "glfw_view.hpp"
 #include "glfw_renderer_frontend.hpp"
+#include "platform_paths.hpp"
 #include "settings_json.hpp"
 
 #include <mbgl/gfx/backend.hpp>
+#include <mbgl/storage/file_source.hpp>
 #include <mbgl/renderer/renderer.hpp>
 #include <mbgl/storage/database_file_source.hpp>
 #include <mbgl/storage/file_source_manager.hpp>
@@ -18,6 +20,7 @@
 #include <csignal>
 #include <fstream>
 #include <iostream>
+#include <numbers>
 #include <cstdlib>
 #include <cstdio>
 #include <array>
@@ -25,6 +28,17 @@
 namespace {
 
 GLFWView* view = nullptr;
+
+void applyPerformanceDefaults(mbgl::Map& map) {
+    // Fewer tiles at oblique views; press F6 in the demo app to cycle profiles.
+    map.setTileLodMinRadius(2);
+    map.setTileLodScale(1.5);
+    map.setTileLodPitchThreshold(std::numbers::pi / 4);
+    map.setTileLodZoomShift(-0.25);
+
+    // Low prefetch when idle; disabled entirely while dragging (see GLFWView::setInteracting).
+    map.setPrefetchZoomDelta(1);
+}
 
 } // namespace
 
@@ -94,7 +108,7 @@ int main(int argc, char* argv[]) {
     const bool fullscreen = fullscreenFlag ? args::get(fullscreenFlag) : false;
     const bool benchmark = benchmarkFlag ? args::get(benchmarkFlag) : false;
     std::string style = styleValue ? args::get(styleValue) : "";
-    const std::string cacheDB = cacheDBValue ? args::get(cacheDBValue) : "/tmp/mbgl-cache.db";
+    const std::string cacheDB = cacheDBValue ? args::get(cacheDBValue) : mbgl::glfw_app::defaultCachePath();
 
     // sigint handling
 #ifdef WIN32
@@ -108,7 +122,8 @@ int main(int argc, char* argv[]) {
 #endif
 
     if (benchmark) {
-        mbgl::Log::Info(mbgl::Event::General, "BENCHMARK MODE: Some optimizations are disabled.");
+        mbgl::Log::Info(mbgl::Event::General,
+                        "BENCHMARK MODE: logs frame/cpu/gpu timing every second. Use -b or --benchmark.");
     }
 
     // Set access token if present
@@ -117,7 +132,12 @@ int main(int argc, char* argv[]) {
 
     auto mapTilerConfiguration = mbgl::TileServerOptions::MapTilerConfiguration();
     mbgl::ResourceOptions resourceOptions;
-    resourceOptions.withCachePath(cacheDB).withApiKey(apikey).withTileServerOptions(mapTilerConfiguration);
+    resourceOptions.withCachePath(cacheDB)
+        .withApiKey(apikey)
+        .withTileServerOptions(mapTilerConfiguration)
+        .withMaximumCacheSize(512 * 1024 * 1024);
+    mbgl::Log::Info(mbgl::Event::Setup, "Tile cache: " + cacheDB + " (max " +
+                                         std::to_string(resourceOptions.maximumCacheSize() / (1024 * 1024)) + " MB)");
     mbgl::ClientOptions clientOptions;
     auto orderedStyles = mapTilerConfiguration.defaultStyles();
 
@@ -126,6 +146,9 @@ int main(int argc, char* argv[]) {
 
     std::shared_ptr<mbgl::FileSource> onlineFileSource = mbgl::FileSourceManager::get()->getFileSource(
         mbgl::FileSourceType::Network, resourceOptions, clientOptions);
+    if (onlineFileSource) {
+        onlineFileSource->setProperty(mbgl::MAX_CONCURRENT_REQUESTS_KEY, 64u);
+    }
     if (!settings.online) {
         if (onlineFileSource) {
             onlineFileSource->setProperty("online-status", false);
@@ -150,12 +173,16 @@ int main(int argc, char* argv[]) {
 
     mbgl::Map map(rendererFrontend,
                   *view,
-                  mbgl::MapOptions().withSize(view->getSize()).withPixelRatio(view->getPixelRatio()),
+                  mbgl::MapOptions()
+                      .withSize(view->getSize())
+                      .withPixelRatio(view->getPixelRatio())
+                      .withCrossSourceCollisions(false),
                   resourceOptions,
                   clientOptions,
                   actionJournalOptions);
 
     map.setBounds(mbgl::BoundOptions().withMaxPitch(settings.maxPitch));
+    applyPerformanceDefaults(map);
 
     backend.setMap(&map);
 
@@ -226,6 +253,14 @@ int main(int argc, char* argv[]) {
         databaseFileSource->resetDatabase([](const std::exception_ptr& ex) {
             if (ex) {
                 mbgl::Log::Error(mbgl::Event::Database, "Failed to reset cache: " + mbgl::util::toString(ex));
+            }
+        });
+    });
+
+    view->setMaintenanceCallback([databaseFileSource]() {
+        databaseFileSource->packDatabase([](const std::exception_ptr& ex) {
+            if (ex) {
+                mbgl::Log::Warning(mbgl::Event::Database, "Cache pack failed: " + mbgl::util::toString(ex));
             }
         });
     });

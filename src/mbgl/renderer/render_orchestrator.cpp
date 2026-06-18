@@ -161,6 +161,8 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
     const auto startTime = util::MonotonicTimer::now().count();
 
     const bool isMapModeContinuous = updateParameters->mode == MapMode::Continuous;
+    const bool gestureFrozen = updateParameters->transformState.isGestureInProgress();
+    gestureInterruptionFrozen = gestureFrozen;
     if (!isMapModeContinuous) {
         // Reset zoom history state.
         zoomHistory.first = true;
@@ -317,6 +319,9 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
 
         if (layerAddedOrChanged || zoomChangedAndMatters || evaluationParameters.hasCrossfade ||
             layer.hasTransition()) {
+            if (gestureFrozen) {
+                continue;
+            }
             const auto previousMask = layer.evaluatedProperties->constantsMask();
             layer.evaluate(evaluationParameters);
             if (previousMask != layer.evaluatedProperties->constantsMask()) {
@@ -350,6 +355,7 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
                                                                        updateParameters->debugOptions,
                                                                        updateParameters->timePoint,
                                                                        renderLight.getEvaluated());
+    renderTreeParameters->transformOnly = gestureFrozen;
 
     std::set<LayerRenderItem> layerRenderItems;
     layersNeedPlacement.clear();
@@ -382,7 +388,7 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
             if (layerInfo->source != LayerTypeInfo::Source::NotRequired) {
                 if (layer.baseImpl->source == sourceImpl->id) {
                     const std::string& layerId = layer.getID();
-                    sourceNeedsRelayout = (sourceNeedsRelayout || hasImageDiff ||
+                    sourceNeedsRelayout = !gestureFrozen && (sourceNeedsRelayout || hasImageDiff ||
                                            constantsMaskChanged.contains(layerId) ||
                                            hasLayoutDifference(layerDiff, layerId));
                     if (layerIsVisible) {
@@ -438,11 +444,13 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
             renderSource->prepare({.transform = renderTreeParameters->transformParams,
                                    .debugOptions = updateParameters->debugOptions,
                                    .imageManager = *imageManager,
-                                   .sourceName = name});
+                                   .sourceName = name,
+                                   .transformOnly = gestureFrozen});
         }
     }
 
     auto opaquePassCutOffEstimation = layerRenderItems.size();
+    if (!gestureFrozen) {
     for (auto& renderItem : layerRenderItems) {
         RenderLayer& renderLayer = renderItem.layer;
         MLN_TRACE_ZONE(prepare layer);
@@ -453,7 +461,7 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
                              .patternAtlas = *patternAtlas,
                              .lineAtlas = *lineAtlas,
                              .state = updateParameters->transformState});
-        if (renderLayer.needsPlacement()) {
+        if (renderLayer.needsPlacement() && !gestureFrozen) {
             layersNeedPlacement.emplace_back(renderLayer);
         }
         if (renderTreeParameters->opaquePassCutOff == 0) {
@@ -463,27 +471,40 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
             }
         }
     }
+    }
 
     // Symbol placement.
     assert((updateParameters->mode == MapMode::Tile) || !placedSymbolDataCollected);
     bool symbolBucketsChanged = false;
     bool symbolBucketsAdded = false;
     std::set<std::string> usedSymbolLayers;
+    const bool gestureFrozenPlacement = updateParameters->transformState.isGestureInProgress();
     const auto longitude = static_cast<float>(updateParameters->transformState.getLatLng().longitude());
-    for (auto it = layersNeedPlacement.crbegin(); it != layersNeedPlacement.crend(); ++it) {
-        MLN_TRACE_ZONE(placement layer);
-        RenderLayer& layer = *it;
-        auto result = crossTileSymbolIndex.addLayer(layer, longitude);
-        if (isMapModeContinuous) {
-            usedSymbolLayers.insert(layer.getID());
-            symbolBucketsAdded = symbolBucketsAdded || (result & CrossTileSymbolIndex::AddLayerResult::BucketsAdded);
-            symbolBucketsChanged = symbolBucketsChanged || (result != CrossTileSymbolIndex::AddLayerResult::NoChanges);
+    if (!gestureFrozenPlacement) {
+        for (auto it = layersNeedPlacement.crbegin(); it != layersNeedPlacement.crend(); ++it) {
+            MLN_TRACE_ZONE(placement layer);
+            RenderLayer& layer = *it;
+            auto result = crossTileSymbolIndex.addLayer(layer, longitude);
+            if (isMapModeContinuous) {
+                usedSymbolLayers.insert(layer.getID());
+                symbolBucketsAdded = symbolBucketsAdded || (result & CrossTileSymbolIndex::AddLayerResult::BucketsAdded);
+                symbolBucketsChanged =
+                    symbolBucketsChanged || (result != CrossTileSymbolIndex::AddLayerResult::NoChanges);
+            }
         }
     }
 
     if (isMapModeContinuous) {
         MLN_TRACE_ZONE(placement);
 
+        if (gestureFrozenPlacement) {
+            // Transform-only mode: redraw existing GPU content with the new matrix.
+            renderTreeParameters->placementChanged = false;
+            placementController.setPlacementStale();
+            renderTreeParameters->symbolFadeChange = placementController.getPlacement()->symbolFadeChange(
+                updateParameters->timePoint);
+            renderTreeParameters->needsRepaint = hasTransitions(updateParameters->timePoint);
+        } else {
         std::optional<Duration> placementUpdatePeriodOverride;
         if (symbolBucketsAdded && !tiltedView) {
             // If the view is not tilted, we want *the new* symbols to show up
@@ -517,6 +538,7 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
         renderTreeParameters->symbolFadeChange = placementController.getPlacement()->symbolFadeChange(
             updateParameters->timePoint);
         renderTreeParameters->needsRepaint = hasTransitions(updateParameters->timePoint);
+        }
     } else {
         MLN_TRACE_ZONE(placement);
 
@@ -532,7 +554,7 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
         renderTreeParameters->needsRepaint = false;
     }
 
-    if (!renderTreeParameters->needsRepaint && renderTreeParameters->loaded) {
+    if (!renderTreeParameters->needsRepaint && renderTreeParameters->loaded && !gestureFrozenPlacement) {
         MLN_TRACE_ZONE(reduce);
         // Notify observer about unused images when map is fully loaded
         // and there are no ongoing transitions.
@@ -1056,6 +1078,10 @@ void RenderOrchestrator::onTileError(RenderSource& source, const OverscaledTileI
 
 void RenderOrchestrator::onTileChanged(RenderSource&, const OverscaledTileID&) {
     MLN_TRACE_FUNC();
+
+    if (gestureInterruptionFrozen) {
+        return;
+    }
 
     observer->onInvalidate();
 }

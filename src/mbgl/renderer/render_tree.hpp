@@ -83,6 +83,7 @@ public:
     bool needsRepaint = false;
     bool loaded = false;
     bool placementChanged = false;
+    bool transformOnly = false;
 };
 
 class RenderTree {

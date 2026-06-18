@@ -20,7 +20,13 @@ class DatabaseFileSourceThread {
 public:
     DatabaseFileSourceThread(std::shared_ptr<FileSource> onlineFileSource_, const std::string& cachePath)
         : db(std::make_unique<OfflineDatabase>(cachePath, onlineFileSource_->getResourceOptions().tileServerOptions())),
-          onlineFileSource(std::move(onlineFileSource_)) {}
+          onlineFileSource(std::move(onlineFileSource_)) {
+        const auto maxCacheSize = onlineFileSource->getResourceOptions().maximumCacheSize();
+        if (maxCacheSize > 0) {
+            db->setMaximumAmbientCacheSize(maxCacheSize);
+        }
+        db->runPackDatabaseAutomatically(true);
+    }
 
     void request(const Resource& resource, const ActorRef<FileSourceRequest>& req) {
         std::optional<Response> offlineResponse = (resource.storagePolicy != Resource::StoragePolicy::Volatile)

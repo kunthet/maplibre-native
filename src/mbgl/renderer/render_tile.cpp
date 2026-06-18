@@ -110,13 +110,14 @@ void RenderTile::upload(gfx::UploadPass& uploadPass) const {
 }
 
 void RenderTile::prepare(const SourcePrepareParameters& parameters) {
-    renderData = tile.createRenderData();
-    assert(renderData);
-    renderData->prepare(parameters);
+    if (!parameters.transformOnly || !renderData) {
+        renderData = tile.createRenderData();
+        assert(renderData);
+        renderData->prepare(parameters);
+        needsRendering = tile.usedByRenderedLayers;
+    }
 
-    needsRendering = tile.usedByRenderedLayers;
-
-    if (parameters.debugOptions != MapDebugOptions::NoDebug &&
+    if (!parameters.transformOnly &&
         (!debugBucket || debugBucket->renderable != tile.isRenderable() || debugBucket->complete != tile.isComplete() ||
          !(debugBucket->modified == tile.modified) || !(debugBucket->expires == tile.expires) ||
          debugBucket->debugMode != parameters.debugOptions)) {

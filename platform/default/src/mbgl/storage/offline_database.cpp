@@ -78,6 +78,9 @@ void OfflineDatabase::initialize() {
             migrateToVersion6();
             // fall through
         case 6:
+            migrateToVersion7();
+            // fall through
+        case 7:
             // Happy path; we're done
             return;
         default:
@@ -180,11 +183,11 @@ void OfflineDatabase::createSchema() {
     checkFlags();
 
     vacuum();
-    db->exec("PRAGMA journal_mode = DELETE");
-    db->exec("PRAGMA synchronous = FULL");
+    db->exec("PRAGMA journal_mode = WAL");
+    db->exec("PRAGMA synchronous = NORMAL");
     mapbox::sqlite::Transaction transaction(*db);
     db->exec(offlineDatabaseSchema);
-    db->exec("PRAGMA user_version = 6");
+    db->exec("PRAGMA user_version = 7");
     transaction.commit();
 }
 
@@ -224,6 +227,15 @@ void OfflineDatabase::migrateToVersion6() {
         "0");
     db->exec("PRAGMA user_version = 6");
     transaction.commit();
+}
+
+void OfflineDatabase::migrateToVersion7() {
+    assert(db);
+    checkFlags();
+
+    db->exec("PRAGMA journal_mode = WAL");
+    db->exec("PRAGMA synchronous = NORMAL");
+    db->exec("PRAGMA user_version = 7");
 }
 
 void OfflineDatabase::vacuum() {

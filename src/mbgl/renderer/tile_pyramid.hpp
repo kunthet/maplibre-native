@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <vector>
 #include <map>
+#include <set>
 
 namespace mbgl {
 
@@ -74,6 +75,8 @@ public:
 
 private:
     void addRenderTile(const UnwrappedTileID& tileID, Tile& tile);
+
+    std::optional<std::set<UnwrappedTileID>> gestureFrozenTileIds;
 
     std::map<OverscaledTileID, std::unique_ptr<Tile>> tiles;
     TileCache cache;

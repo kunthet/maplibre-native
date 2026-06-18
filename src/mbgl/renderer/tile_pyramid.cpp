@@ -89,6 +89,30 @@ void TilePyramid::update(const std::vector<Immutable<style::LayerProperties>>& l
         return;
     }
 
+    // While the user is dragging, only transform already-rendered tiles. Do not
+    // fetch, parse, or display any new tiles until the gesture ends.
+    if (parameters.transformState.isGestureInProgress()) {
+        for (auto& pair : tiles) {
+            pair.second->setNecessity(TileNecessity::Optional);
+        }
+        if (!gestureFrozenTileIds) {
+            gestureFrozenTileIds.emplace();
+            for (const auto& entry : renderedTiles) {
+                gestureFrozenTileIds->insert(entry.first);
+            }
+        }
+        for (auto it = renderedTiles.begin(); it != renderedTiles.end();) {
+            if (gestureFrozenTileIds->find(it->first) == gestureFrozenTileIds->end()) {
+                it = renderedTiles.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        return;
+    }
+
+    gestureFrozenTileIds.reset();
+
     handleWrapJump(static_cast<float>(parameters.transformState.getLatLng().longitude()));
 
     // Optionally shift the zoom level
@@ -435,6 +459,7 @@ void TilePyramid::dumpDebugLogs() const {
 
 void TilePyramid::clearAll() {
     fadingTiles = false;
+    gestureFrozenTileIds.reset();
     tiles.clear();
     renderedTiles.clear();
     cache.clear();

@@ -107,6 +107,7 @@ public:
     void setConstrainMode(ConstrainMode);
     void setViewportMode(ViewportMode);
     void setSize(Size);
+    void setPixelRatio(float);
     void setFrustumOffset(const EdgeInsets&);
     EdgeInsets getFrustumOffset();
     MapOptions getMapOptions() const;

@@ -1,4 +1,5 @@
 #include "settings_json.hpp"
+#include "platform_paths.hpp"
 #include <fstream>
 #include <mbgl/util/constants.hpp>
 #include <mbgl/math/angles.hpp>
@@ -10,7 +11,7 @@ Settings_JSON::Settings_JSON() {
 }
 
 void Settings_JSON::load() {
-    std::ifstream file("/tmp/mbgl-native.cfg");
+    std::ifstream file(mbgl::glfw_app::defaultSettingsPath());
     if (file) {
         file >> longitude;
         file >> latitude;
@@ -27,7 +28,7 @@ void Settings_JSON::load() {
 }
 
 void Settings_JSON::save() {
-    std::ofstream file("/tmp/mbgl-native.cfg");
+    std::ofstream file(mbgl::glfw_app::defaultSettingsPath());
     if (file) {
         file << longitude << std::endl;
         file << latitude << std::endl;

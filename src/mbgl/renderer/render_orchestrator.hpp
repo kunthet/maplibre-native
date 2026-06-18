@@ -224,6 +224,7 @@ private:
     bool contextLost = false;
     bool placedSymbolDataCollected = false;
     bool tileCacheEnabled = true;
+    bool gestureInterruptionFrozen = false;
 
 #if MLN_RENDER_BACKEND_OPENGL
     bool androidGoldfishMitigationEnabled{false};

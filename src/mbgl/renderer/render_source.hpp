@@ -44,6 +44,7 @@ public:
     const MapDebugOptions& debugOptions;
     const ImageManager& imageManager;
     const std::string sourceName;
+    bool transformOnly = false;
 };
 
 using RenderTiles = std::shared_ptr<const std::vector<std::reference_wrapper<const RenderTile>>>;

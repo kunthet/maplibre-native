@@ -25,7 +25,11 @@ void GLFWRendererFrontend::setObserver(mbgl::RendererObserver& observer) {
 
 void GLFWRendererFrontend::update(std::shared_ptr<mbgl::UpdateParameters> params) {
     updateParameters = std::move(params);
-    glfwView.invalidate();
+    if (glfwView.isInteracting()) {
+        glfwView.wake();
+    } else {
+        glfwView.invalidate();
+    }
 }
 
 const mbgl::TaggedScheduler& GLFWRendererFrontend::getThreadPool() const {

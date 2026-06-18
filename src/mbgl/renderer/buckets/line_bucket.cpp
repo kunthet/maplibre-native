@@ -100,7 +100,8 @@ void LineBucket::addGeometry(const GeometryCoordinates& coordinates,
             static bool warned = false; // not thread-safe, there's a small chance of warning more than once
             if (!warned) {
                 warned = true;
-                Log::Warning(Event::General, "Invalid geometry in line layer");
+                Log::Debug(Event::General,
+                           "Skipping invalid geometry in line layer (e.g. point used as line source)");
             }
         }
         return;

@@ -8,6 +8,7 @@
 
 #include <utility>
 #include <optional>
+#include <functional>
 
 #if (defined(MLN_RENDER_BACKEND_OPENGL) || defined(MLN_RENDER_BACKEND_VULKAN) || \
      defined(MLN_RENDER_BACKEND_WEBGPU)) &&                                      \
@@ -58,6 +59,8 @@ public:
 
     void setResetCacheCallback(std::function<void()> callback) { resetDatabaseCallback = std::move(callback); };
 
+    void setMaintenanceCallback(std::function<void()> callback) { maintenanceCallback = std::move(callback); }
+
     void setShouldClose();
 
     void setWindowTitle(const std::string &);
@@ -66,11 +69,17 @@ public:
 
     void invalidate();
 
+    void wake();
+
+    bool isInteracting() const { return interacting; }
+
     mbgl::Size getSize() const;
 
     // mbgl::MapObserver implementation
     void onDidFinishLoadingStyle() override;
+    void onDidBecomeIdle() override;
     void onWillStartRenderingFrame() override;
+    void onDidFinishRenderingFrame(const mbgl::MapObserver::RenderFrameStatus& status) override;
 
 protected:
     // mbgl::Backend implementation
@@ -88,8 +97,22 @@ private:
 
     // Internal
     void report(float duration);
+    void reportBenchmarkStats(const mbgl::gfx::RenderingStats& stats);
 
     void render();
+
+    void setInteracting(bool mouseGestureActive);
+    void extendScrollGestureFreeze();
+    void syncGestureFreezeState();
+    void capturePanSnapshot(double mouseX, double mouseY);
+    void releasePanSnapshot();
+    bool renderPanSnapshot();
+    void prepareForMapContentChange();
+    void clearFeatureHoverState();
+    void syncViewportFromWindow();
+    void updateHoverFeatureState();
+    void restartFrameTick();
+    void processEventsAndRender();
 
     mbgl::Color makeRandomColor() const;
     mbgl::Point<double> makeRandomPoint() const;
@@ -145,6 +168,16 @@ private:
     int frames = 0;
     float frameTime = 0;
     double lastReported = 0;
+    int benchmarkStatFrames = 0;
+    double benchmarkEncodeTime = 0;
+    double benchmarkRenderTime = 0;
+    int benchmarkGestureFrames = 0;
+    double benchmarkGestureEncodeTime = 0;
+    double benchmarkGestureRenderTime = 0;
+    int benchmarkNonGestureFrames = 0;
+    double benchmarkNonGestureEncodeTime = 0;
+    double benchmarkNonGestureRenderTime = 0;
+    bool lastFrameWasGesture = false;
 
     int width = 1024;
     int height = 768;
@@ -158,13 +191,27 @@ private:
     std::function<void()> pauseResumeCallback;
     std::function<void()> onlineStatusCallback;
     std::function<void()> resetDatabaseCallback;
+    std::function<void()> maintenanceCallback;
     std::function<void(mbgl::Map *)> animateRouteCallback;
 
     mbgl::util::RunLoop runLoop;
     mbgl::util::Timer frameTick;
+    mbgl::util::Timer maintenanceTick;
+    mbgl::util::Timer scrollFreezeTimer;
 
     GLFWwindow *window = nullptr;
     bool dirty = false;
+    bool interacting = false;
+    bool mouseGestureActive = false;
+    bool scrollGestureFrozen = false;
+    bool panSnapshotActive = false;
+    double panSnapshotOriginX = 0;
+    double panSnapshotOriginY = 0;
+    bool preferVSync = false;
+    double lastInteractionTime = 0;
+    double lastRenderTime = 0;
+    double savedTileLodZoomShift = 0;
+    uint8_t savedPrefetchZoomDelta = 1;
     std::optional<std::string> featureID;
     std::unique_ptr<mbgl::MapSnapshotter> snapshotter;
     std::unique_ptr<SnapshotObserver> snapshotterObserver;

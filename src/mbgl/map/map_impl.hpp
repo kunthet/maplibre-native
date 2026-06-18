@@ -89,7 +89,7 @@ public:
     Transform transform;
 
     const MapMode mode;
-    const float pixelRatio;
+    float pixelRatio;
     const bool crossSourceCollisions;
 
     MapDebugOptions debugOptions{MapDebugOptions::NoDebug};

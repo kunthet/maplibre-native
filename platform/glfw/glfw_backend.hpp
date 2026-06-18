@@ -25,4 +25,12 @@ public:
     virtual mbgl::gfx::RendererBackend& getRendererBackend() = 0;
     virtual mbgl::Size getSize() const = 0;
     virtual void setSize(mbgl::Size) = 0;
+    virtual void setVSyncEnabled(bool enabled) { (void)enabled; }
+
+    // QGIS-style pan: blit a captured framebuffer while dragging (OpenGL only).
+    virtual void requestPanSnapshotCaptureOnNextSwap() {}
+    virtual bool captureDisplayedPanSnapshot() { return false; }
+    virtual bool drawPanSnapshot(float offsetX, float offsetY) { return false; }
+    virtual void releasePanSnapshot() {}
+    virtual bool hasPanSnapshot() const { return false; }
 };

@@ -375,6 +375,14 @@ void Map::setSize(const Size size) {
     impl->onUpdate();
 }
 
+void Map::setPixelRatio(const float ratio) {
+    if (std::abs(impl->pixelRatio - ratio) < 0.0001f) {
+        return;
+    }
+    impl->pixelRatio = ratio;
+    impl->onUpdate();
+}
+
 void Map::setFrustumOffset(const EdgeInsets& frustumOffset) {
     impl->transform.setFrustumOffset(frustumOffset);
     impl->onUpdate();
