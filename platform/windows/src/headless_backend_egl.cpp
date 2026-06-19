@@ -69,11 +69,12 @@ public:
 class EGLBackendImpl : public HeadlessBackend::Impl {
 public:
     EGLBackendImpl() {
-        // EGL initializes the context client version to 1 by default. We want
-        // to use OpenGL ES 2.0 which has the ability to create shader and
-        // program objects and also to write vertex and fragment shaders in the
-        // OpenGL ES Shading Language.
-        const EGLint attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+        // Request an OpenGL ES 3.0 context. ES3 is backward compatible with the
+        // ES2 feature set mbgl relies on, and it adds the entry points the
+        // Windows zero-copy surface needs (glBlitFramebuffer, GL_READ/DRAW_-
+        // FRAMEBUFFER). MapLibre's Android backend already runs on ES3, and the
+        // config was chosen with EGL_OPENGL_ES3_BIT, so this is safe.
+        const EGLint attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
 
         eglContext = eglCreateContext(eglDisplay->display, eglDisplay->config, EGL_NO_CONTEXT, attribs);
         if (eglContext == EGL_NO_CONTEXT) {

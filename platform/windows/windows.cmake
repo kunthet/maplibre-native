@@ -116,6 +116,10 @@ if(MLN_WITH_EGL)
     if(MSVC)
         find_package(unofficial-angle CONFIG REQUIRED)
 
+        # ANGLE's D3D11 backend does not support the streaming UBO glMapBufferRange
+        # path; skip it entirely so every UBO uses a direct glBufferData allocation.
+        target_compile_definitions(mbgl-core PRIVATE MBGL_ANGLE_DISABLE_UBO_POOL=1)
+
         target_link_libraries(
             mbgl-core
             PRIVATE

@@ -129,8 +129,13 @@ public:
 
     void setOwner(OwnerClass* owner_) noexcept { owner = owner_; }
 
-    /// Allocate buffer memory and copy `size` bytes into the allocation from `data`
-    void allocate(const void* data, size_t size) noexcept {
+    /// Allocate buffer memory and copy `size` bytes into the allocation from `data`.
+    /// Returns false if the underlying allocator could not provide storage (for
+    /// example a failed buffer map on backends with limited mapping support such
+    /// as ANGLE's D3D11 path). On failure no reference is retained and the caller
+    /// must fall back to a self-managed allocation -- crucially we never
+    /// dereference a null reference here.
+    bool allocate(const void* data, size_t size) noexcept {
         assert(owner);
 
         if (ref && ref->getOwner()) {
@@ -140,13 +145,17 @@ public:
         }
 
         BufferRef* reference = ref;
-        allocator.write(data, size, reference);
+        if (!allocator.write(data, size, reference) || reference == nullptr) {
+            ref = nullptr;
+            return false;
+        }
 
         ref = std::move(static_cast<decltype(ref)>(reference));
         ref->setOwner(owner);
 
         contents.resize(size);
         std::memcpy(contents.data(), data, size);
+        return true;
     };
 
     IBufferAllocator& allocator;

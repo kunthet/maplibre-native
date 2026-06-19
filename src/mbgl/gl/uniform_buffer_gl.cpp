@@ -41,24 +41,31 @@ UniformBufferGL::UniformBufferGL(Context& context_, const void* data_, std::size
     context.renderingStats().numBuffers++;
     context.renderingStats().memBuffers += size;
 
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || defined(MBGL_ANGLE_DISABLE_UBO_POOL)
     constexpr bool forceDisableManagedAllocation{true};
 #else
     constexpr bool forceDisableManagedAllocation{false};
 #endif
 
     MLN_TRACE_ALLOC_CONST_BUFFER(uniqueDebugId, size_);
-    if (forceDisableManagedAllocation || size_ > managedBuffer.allocator.pageSize()) {
-        // Buffer is very large, won't fit in the provided allocator
-        MBGL_CHECK_ERROR(glGenBuffers(1, &localID));
-        MBGL_CHECK_ERROR(glBindBuffer(GL_UNIFORM_BUFFER, localID));
-        MBGL_CHECK_ERROR(glBufferData(GL_UNIFORM_BUFFER, size, data_, GL_DYNAMIC_DRAW));
-        MBGL_CHECK_ERROR(glBindBuffer(GL_UNIFORM_BUFFER, 0));
+
+    // Prefer the streaming sub-allocator for small buffers. If it cannot provide
+    // storage (e.g. glMapBufferRange is unsupported / fails on the active backend,
+    // as observed on ANGLE's D3D11 path), gracefully fall back to a self-managed
+    // buffer rather than crashing on a null allocation reference.
+    const bool tryManaged = !forceDisableManagedAllocation && size_ <= managedBuffer.allocator.pageSize();
+    if (tryManaged && managedBuffer.allocate(data_, size_)) {
+        isManagedAllocation = true;
         return;
     }
 
-    isManagedAllocation = true;
-    managedBuffer.allocate(data_, size_);
+    // Self-managed allocation: buffer is very large, managed allocation is
+    // disabled, or the streaming allocator failed to map a buffer.
+    isManagedAllocation = false;
+    MBGL_CHECK_ERROR(glGenBuffers(1, &localID));
+    MBGL_CHECK_ERROR(glBindBuffer(GL_UNIFORM_BUFFER, localID));
+    MBGL_CHECK_ERROR(glBufferData(GL_UNIFORM_BUFFER, size, data_, GL_DYNAMIC_DRAW));
+    MBGL_CHECK_ERROR(glBindBuffer(GL_UNIFORM_BUFFER, 0));
 }
 
 UniformBufferGL::UniformBufferGL(UniformBufferGL&& rhs) noexcept
@@ -136,11 +143,14 @@ void UniformBufferGL::update(const void* data, std::size_t dataSize) {
         return;
     }
 
-    if (std::memcmp(data, managedBuffer.getContents().data(), dataSize) == 0) {
-        return;
-    }
-
     if (isManagedAllocation) {
+        // The managed buffer mirrors GPU contents on the CPU, so we can skip the
+        // upload when nothing changed. (Self-managed buffers keep no mirror, so
+        // this dedup -- and its memcmp against an empty contents vector -- must be
+        // skipped for them.)
+        if (std::memcmp(data, managedBuffer.getContents().data(), dataSize) == 0) {
+            return;
+        }
         managedBuffer.allocate(data, dataSize);
     } else {
         MBGL_CHECK_ERROR(glBindBuffer(GL_UNIFORM_BUFFER, localID));

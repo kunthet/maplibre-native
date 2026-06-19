@@ -3,7 +3,9 @@
 #include <mbgl/gl/context.hpp>
 #include <mbgl/gl/uniform_buffer_gl.hpp>
 #include <mbgl/util/instrumentation.hpp>
+#include <mbgl/util/logging.hpp>
 
+#include <sstream>
 #include <utility>
 
 namespace mbgl {
@@ -277,6 +279,19 @@ public:
             residentBuffer = buffer->addRef(nullptr, writtenIndex, size);
             buffer->pointer += alignedSize;
         } else {
+            // glMapBufferRange can fail on backends with limited buffer-mapping
+            // support (notably ANGLE's D3D11 path). Report it once -- the caller
+            // (RelocatableBuffer::allocate) now treats this as a soft failure and
+            // UniformBufferGL falls back to a self-managed buffer.
+            static bool loggedMapFailure = false;
+            if (!loggedMapFailure) {
+                loggedMapFailure = true;
+                const GLenum err = glGetError();
+                std::ostringstream out;
+                out << "UBO glMapBufferRange failed (GL error 0x" << std::hex << err
+                    << "); falling back to self-managed uniform buffers.";
+                Log::Error(Event::OpenGL, out.str());
+            }
             assert(0);
             return false;
         }

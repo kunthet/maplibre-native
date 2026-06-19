@@ -38,7 +38,7 @@ private:
 
     // If the requested UBO size is too large for the allocator, the UBO will manage its own allocation
     bool isManagedAllocation = false;
-    BufferID localID;
+    BufferID localID = 0;
     gl::RelocatableBuffer<UniformBufferGL> managedBuffer;
 
     friend class UniformBufferArrayGL;
