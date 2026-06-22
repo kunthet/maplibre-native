@@ -723,15 +723,25 @@ void MapEmbedder::PublishPanSnapshot(double x, double y) {
 }
 
 void MapEmbedder::SyncGestureFreezeState() {
-    const bool should_freeze = impl_->interacting || impl_->scroll_gesture_frozen;
-    if (impl_->gesture_frozen == should_freeze || !impl_->map) {
+    if (!impl_->map) {
         return;
     }
-    impl_->gesture_frozen = should_freeze;
 
-    impl_->suppress_idle_events.store(should_freeze);
+    // Suppress cameraIdle churn for both pointer gestures and wheel-zoom bursts.
+    const bool should_suppress_idle = impl_->interacting || impl_->scroll_gesture_frozen;
+    impl_->suppress_idle_events.store(should_suppress_idle);
 
-    if (should_freeze) {
+    // Only pointer pan/pitch/rotate use MapLibre's transform-only gesture freeze.
+    // Wheel zoom changes the ideal tile set; freezing tiles during scroll left
+    // stale geometry matrix-transformed at the new zoom (ghost features shifted
+    // north, permanent at world scale). Scroll still coalesces via frame tick.
+    const bool should_freeze_map = impl_->interacting;
+    if (impl_->gesture_frozen == should_freeze_map) {
+        return;
+    }
+    impl_->gesture_frozen = should_freeze_map;
+
+    if (should_freeze_map) {
         impl_->saved_prefetch_zoom_delta = impl_->map->getPrefetchZoomDelta();
         // Keep at least one parent zoom level during gestures so labels/tiles do
         // not pop in and out (prefetch=0 caused visible symbol flicker on pan).
@@ -964,7 +974,7 @@ void MapEmbedder::FinishPanGesture() {
     impl_->finishing_gesture.store(true);
     ClearPanSnapshot(false);
     SetInteracting(false);
-    RequestRenderUntilIdle();
+    RequestRenderQuick();
     impl_->finishing_gesture.store(false);
 }
 
@@ -1005,13 +1015,13 @@ void MapEmbedder::ProcessFrameTick() {
 }
 
 void MapEmbedder::Resize(int width, int height) {
-    InvokeSync([&] {
+    InvokeAsync([this, width, height] {
         ReleasePanSnapshot();
         impl_->width = width;
         impl_->height = height;
         impl_->frontend->setSize(Size{static_cast<uint32_t>(width), static_cast<uint32_t>(height)});
         impl_->map->setSize(impl_->frontend->getSize());
-        RequestRenderUntilIdle();
+        RequestRenderQuick();
     });
 }
 
@@ -1143,6 +1153,7 @@ void MapEmbedder::ProcessPointerOnLoop(const std::string& phase,
     }
 
     if (phase == "down") {
+        impl_->cancel_idle_pump.store(true);
         bool start_pan = false;
         bool start_pitch = false;
         bool start_rotate = false;
@@ -1224,7 +1235,7 @@ void MapEmbedder::ProcessPointerOnLoop(const std::string& phase,
         }
         impl_->gesture_mode = GestureMode::None;
         SetInteracting(false);
-        RequestRenderUntilIdle();
+        RequestRenderQuick();
     }
 }
 
@@ -1235,11 +1246,37 @@ void MapEmbedder::OnPointer(const std::string& phase,
                             bool shift,
                             bool control) {
     if (phase == "down") {
-        InvokeSync([&] { ProcessPointerOnLoop(phase, x, y, scroll_delta, shift, control); });
+        // pointer_down must be set before any co-located "move" events are accepted.
+        {
+            std::lock_guard<std::mutex> lock(impl_->input_mutex);
+            impl_->pointer_down = true;
+            impl_->last_x = x;
+            impl_->last_y = y;
+            impl_->pointer_shift = shift;
+            impl_->pointer_control = control;
+            impl_->has_pending_pan_move = false;
+            impl_->has_pending_scroll = false;
+            if (shift) {
+                impl_->gesture_mode = GestureMode::Pitch;
+            } else if (control) {
+                impl_->gesture_mode = GestureMode::Rotate;
+            } else {
+                impl_->gesture_mode = GestureMode::Pan;
+            }
+        }
+        InvokeAsync([this, phase, x, y, scroll_delta, shift, control] {
+            ProcessPointerOnLoop(phase, x, y, scroll_delta, shift, control);
+        });
         return;
     }
 
     if (phase == "up" || phase == "cancel") {
+        {
+            std::lock_guard<std::mutex> lock(impl_->input_mutex);
+            impl_->has_pending_pan_move = false;
+            impl_->has_pending_scroll = false;
+            impl_->pointer_down = false;
+        }
         InvokeAsync([this, phase, x, y, scroll_delta, shift, control] {
             ProcessPendingPointerInput();
             ProcessPointerOnLoop(phase, x, y, scroll_delta, shift, control);
@@ -1250,8 +1287,10 @@ void MapEmbedder::OnPointer(const std::string& phase,
     if (phase == "scroll") {
         {
             std::lock_guard<std::mutex> lock(impl_->input_mutex);
-            impl_->pending_scroll_x = x;
-            impl_->pending_scroll_y = y;
+            if (!impl_->has_pending_scroll) {
+                impl_->pending_scroll_x = x;
+                impl_->pending_scroll_y = y;
+            }
             impl_->pending_scroll_delta += scroll_delta;
             impl_->has_pending_scroll = true;
         }
@@ -1309,6 +1348,31 @@ void MapEmbedder::AddLayer(const std::string& layer_json, const std::optional<st
             return;
         }
         impl_->map->getStyle().addLayer(std::move(*layer), below_layer_id);
+        RequestRenderUntilIdle();
+    });
+}
+
+void MapEmbedder::ApplyStyleLayers(const std::vector<std::string>& remove_ids,
+                                   const std::vector<std::string>& layer_json) {
+    InvokeAsync([this, remove_ids, layer_json] {
+        if (!impl_->map) {
+            return;
+        }
+        auto& style = impl_->map->getStyle();
+        for (const auto& id : remove_ids) {
+            if (style.getLayer(id)) {
+                style.removeLayer(id);
+            }
+        }
+        for (const auto& json : layer_json) {
+            auto doc = ParseJson(json);
+            style::conversion::Error error;
+            auto layer = style::conversion::convert<std::unique_ptr<style::Layer>>(doc, error);
+            if (!layer) {
+                continue;
+            }
+            style.addLayer(std::move(*layer), std::nullopt);
+        }
         RequestRenderUntilIdle();
     });
 }

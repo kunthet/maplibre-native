@@ -21,6 +21,8 @@ extern "C" {
 
 typedef void (*MapEmbedEventCallback)(void* user_data, const char* type);
 typedef void (*MapEmbedFrameCallback)(void* user_data, const uint8_t* pixels, size_t width, size_t height);
+/// Invoked when a frame is available in a DXGI-shared D3D11 texture (ANGLE/EGL GPU path).
+typedef void (*MapEmbedGpuFrameCallback)(void* user_data, void* shared_handle, int width, int height);
 
 typedef struct MapEmbedHandle MapEmbedHandle;
 
@@ -38,7 +40,11 @@ MAPLIBRE_EMBED_API MapEmbedHandle* map_embed_create(
     MapEmbedEventCallback on_event,
     void* event_user_data,
     MapEmbedFrameCallback on_frame,
-    void* frame_user_data);
+    void* frame_user_data,
+    MapEmbedGpuFrameCallback on_gpu_frame,
+    void* gpu_frame_user_data);
+
+MAPLIBRE_EMBED_API int map_embed_is_gpu_mode(MapEmbedHandle* handle);
 
 MAPLIBRE_EMBED_API void map_embed_destroy(MapEmbedHandle* handle);
 
@@ -85,6 +91,11 @@ MAPLIBRE_EMBED_API void map_embed_on_pointer(MapEmbedHandle* handle,
                                              int control);
 MAPLIBRE_EMBED_API void map_embed_add_source(MapEmbedHandle* handle, const char* id, const char* source_json);
 MAPLIBRE_EMBED_API void map_embed_add_layer(MapEmbedHandle* handle, const char* layer_json, const char* below_layer_id);
+MAPLIBRE_EMBED_API void map_embed_apply_style_layers(MapEmbedHandle* handle,
+                                                     const char* const* remove_ids,
+                                                     size_t remove_count,
+                                                     const char* const* layer_json,
+                                                     size_t layer_count);
 MAPLIBRE_EMBED_API void map_embed_remove_layer(MapEmbedHandle* handle, const char* id);
 MAPLIBRE_EMBED_API void map_embed_remove_source(MapEmbedHandle* handle, const char* id);
 MAPLIBRE_EMBED_API void map_embed_update_geojson(MapEmbedHandle* handle, const char* id, const char* data);

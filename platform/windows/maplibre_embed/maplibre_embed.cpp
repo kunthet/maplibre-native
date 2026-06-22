@@ -23,7 +23,9 @@ MapEmbedHandle* map_embed_create(int width,
                                  MapEmbedEventCallback on_event,
                                  void* event_user_data,
                                  MapEmbedFrameCallback on_frame,
-                                 void* frame_user_data) {
+                                 void* frame_user_data,
+                                 MapEmbedGpuFrameCallback on_gpu_frame,
+                                 void* gpu_frame_user_data) {
     std::optional<maplibre_windows::CameraState> init_camera;
     if (has_camera) {
         maplibre_windows::CameraState camera;
@@ -36,6 +38,12 @@ MapEmbedHandle* map_embed_create(int width,
     }
 
   auto handle = new MapEmbedHandle();
+  maplibre_windows::GpuFrameCallback gpu_frame_cb;
+  if (on_gpu_frame) {
+      gpu_frame_cb = [on_gpu_frame, gpu_frame_user_data](void* shared_handle, int width, int height) {
+          on_gpu_frame(gpu_frame_user_data, shared_handle, width, height);
+      };
+  }
   handle->embedder = std::make_unique<maplibre_windows::MapEmbedder>(
       width,
       height,
@@ -47,8 +55,14 @@ MapEmbedHandle* map_embed_create(int width,
       },
       [on_frame, frame_user_data](const uint8_t* data, size_t w, size_t h) {
           if (on_frame) on_frame(frame_user_data, data, w, h);
-      });
+      },
+      std::move(gpu_frame_cb));
   return handle;
+}
+
+int map_embed_is_gpu_mode(MapEmbedHandle* handle) {
+    if (!handle || !handle->embedder) return 0;
+    return handle->embedder->IsGpuMode() ? 1 : 0;
 }
 
 void map_embed_destroy(MapEmbedHandle* handle) {
@@ -137,8 +151,10 @@ void map_embed_get_camera(MapEmbedHandle* handle,
 void map_embed_to_lng_lat(MapEmbedHandle* handle, double x, double y, double* lon, double* lat) {
     if (!handle || !handle->embedder) return;
     const auto result = handle->embedder->ToLngLat(x, y);
-    if (lon) *lon = result.second;
-    if (lat) *lat = result.first;
+    // ToLngLat returns {longitude, latitude}; do not swap (Flutter plugin returns
+    // [lat, lon] in Dart only — the C out-params are named lon/lat).
+    if (lon) *lon = result.first;
+    if (lat) *lat = result.second;
 }
 
 void map_embed_to_screen(MapEmbedHandle* handle, double lon, double lat, double* x, double* y) {
@@ -173,6 +189,35 @@ void map_embed_add_layer(MapEmbedHandle* handle, const char* layer_json, const c
         if (below_layer_id && below_layer_id[0] != '\0') below = below_layer_id;
         handle->embedder->AddLayer(layer_json, below);
     }
+}
+
+void map_embed_apply_style_layers(MapEmbedHandle* handle,
+                                  const char* const* remove_ids,
+                                  size_t remove_count,
+                                  const char* const* layer_json,
+                                  size_t layer_count) {
+    if (!handle || !handle->embedder) {
+        return;
+    }
+    std::vector<std::string> remove;
+    if (remove_ids) {
+        remove.reserve(remove_count);
+        for (size_t i = 0; i < remove_count; ++i) {
+            if (remove_ids[i]) {
+                remove.emplace_back(remove_ids[i]);
+            }
+        }
+    }
+    std::vector<std::string> layers;
+    if (layer_json) {
+        layers.reserve(layer_count);
+        for (size_t i = 0; i < layer_count; ++i) {
+            if (layer_json[i]) {
+                layers.emplace_back(layer_json[i]);
+            }
+        }
+    }
+    handle->embedder->ApplyStyleLayers(remove, layers);
 }
 
 void map_embed_remove_layer(MapEmbedHandle* handle, const char* id) {

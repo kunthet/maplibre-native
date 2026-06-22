@@ -65,6 +65,8 @@ public:
 
     void AddSource(const std::string& id, const std::string& source_json);
     void AddLayer(const std::string& layer_json, const std::optional<std::string>& below_layer_id);
+    void ApplyStyleLayers(const std::vector<std::string>& remove_ids,
+                          const std::vector<std::string>& layer_json);
     void RemoveLayer(const std::string& id);
     void RemoveSource(const std::string& id);
     void UpdateGeoJsonSource(const std::string& id, const std::string& data);
