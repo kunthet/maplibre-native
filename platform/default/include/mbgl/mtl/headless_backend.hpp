@@ -19,6 +19,10 @@ public:
     gfx::Renderable& getDefaultRenderable() override;
     PremultipliedImage readStillImage() override;
     MTL::Texture* getMetalTexture();
+    /// Commits any pending Metal command buffer without blocking on GPU completion
+    /// so the offscreen color texture can be blitted while the map thread keeps
+    /// processing InvokeSync work. No-op when no frame was rendered.
+    void prepareFrameForExport();
     RendererBackend* getRendererBackend() override;
     SwapBehaviour getSwapBehaviour();
 

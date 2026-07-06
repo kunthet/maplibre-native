@@ -51,6 +51,8 @@ public:
 
     MTL::Texture* getMetalTexture() const noexcept;
 
+    bool hasMetalTexture() const noexcept { return metalTexture.get() != nullptr; }
+
     void updateSamplerConfiguration();
 
     /// @brief Bind this texture to the specified location

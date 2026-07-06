@@ -21,8 +21,16 @@ extern "C" {
 
 typedef void (*MapEmbedEventCallback)(void* user_data, const char* type);
 typedef void (*MapEmbedFrameCallback)(void* user_data, const uint8_t* pixels, size_t width, size_t height);
-/// Invoked when a frame is available in a DXGI-shared D3D11 texture (ANGLE/EGL GPU path).
-typedef void (*MapEmbedGpuFrameCallback)(void* user_data, void* shared_handle, int width, int height);
+/// Invoked when a frame is available on the GPU path (D3D11 shared texture or IOSurface).
+/// On macOS, `producer_event` / `consumer_event` are MTLSharedEvent* and `producer_value` is the
+/// timeline value signaled after the blit. On Windows these are always null / 0.
+typedef void (*MapEmbedGpuFrameCallback)(void* user_data,
+                                          void* shared_handle,
+                                          int width,
+                                          int height,
+                                          void* producer_event,
+                                          void* consumer_event,
+                                          uint64_t producer_value);
 
 typedef struct MapEmbedHandle MapEmbedHandle;
 
@@ -45,6 +53,16 @@ MAPLIBRE_EMBED_API MapEmbedHandle* map_embed_create(
     void* gpu_frame_user_data);
 
 MAPLIBRE_EMBED_API int map_embed_is_gpu_mode(MapEmbedHandle* handle);
+
+typedef struct MapEmbedGpuFrameSync {
+    void* producer_event;
+    void* consumer_event;
+    uint64_t producer_value;
+} MapEmbedGpuFrameSync;
+
+/// Fills sync handles for the frame that just invoked the GPU callback. Call on
+/// the map thread from inside `MapEmbedGpuFrameCallback` only.
+MAPLIBRE_EMBED_API int map_embed_get_gpu_frame_sync(MapEmbedHandle* handle, MapEmbedGpuFrameSync* out);
 
 MAPLIBRE_EMBED_API void map_embed_destroy(MapEmbedHandle* handle);
 

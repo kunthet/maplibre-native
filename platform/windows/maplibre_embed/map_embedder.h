@@ -8,7 +8,12 @@
 #include <thread>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
+
 namespace maplibre_windows {
+
 
 struct CameraState {
     double lat = 0;
@@ -23,7 +28,12 @@ using EventCallback = std::function<void(const std::string& type, const std::str
 /// Invoked when a frame has been rendered into a GPU-resident shared texture.
 /// `shared_handle` is a DXGI legacy shared HANDLE; `width`/`height` are physical
 /// pixels. Only used when the ANGLE/EGL zero-copy path is active.
-using GpuFrameCallback = std::function<void(void* shared_handle, int width, int height)>;
+using GpuFrameCallback = std::function<void(void* shared_handle,
+                                            int width,
+                                            int height,
+                                            void* producer_event,
+                                            void* consumer_event,
+                                            uint64_t producer_value)>;
 
 /// Owns mbgl::Map on a dedicated RunLoop thread and renders via HeadlessFrontend.
 class MapEmbedder {
@@ -41,6 +51,9 @@ public:
     /// True when the zero-copy GPU surface path is active. Valid immediately
     /// after construction; the plugin uses it to pick the texture variant.
     bool IsGpuMode() const;
+
+    /// Producer/consumer MTLSharedEvent handles for the last published GPU frame.
+    bool GetGpuFrameSync(void** producer_event, void** consumer_event, uint64_t* producer_value) const;
 
     MapEmbedder(const MapEmbedder&) = delete;
     MapEmbedder& operator=(const MapEmbedder&) = delete;
@@ -107,6 +120,7 @@ private:
     void ClearPanSnapshot(bool trigger_repaint = false);
     void FinishPanGesture();
     void ShutdownOnRunLoop();
+    void OnStyleFullyLoaded();
     void ProcessPointerOnLoop(const std::string& phase,
                               double x,
                               double y,
@@ -125,8 +139,17 @@ private:
     std::condition_variable ready_cv_;
     bool thread_ready_ = false;
 
+#if defined(__APPLE__)
+    // macOS gives a std::thread only a 512 KB stack, which overflows deep inside
+    // CoreGraphics image decoding (mbgl::decodeImage -> CGContextDrawImage, used
+    // by AddImage). Run the map/run-loop thread on a pthread with a large stack.
+    pthread_t thread_{};
+    bool thread_started_ = false;
+#else
     std::thread thread_;
+#endif
     struct Impl;
+
     std::unique_ptr<Impl> impl_;
 };
 

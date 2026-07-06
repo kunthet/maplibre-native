@@ -11,6 +11,16 @@
 namespace mbgl {
 namespace gl {
 
+namespace {
+
+bool choosePixelFormat(const CGLPixelFormatAttribute* attributes, CGLPixelFormatObj& out) {
+    GLint num = 0;
+    const CGLError error = CGLChoosePixelFormat(attributes, &out, &num);
+    return error == kCGLNoError && num > 0 && out != nullptr;
+}
+
+} // namespace
+
 // This class provides a singleton that contains information about the pixel format used for
 // instantiating new headless rendering contexts.
 class CGLDisplayConfig {
@@ -22,29 +32,31 @@ private:
 
 public:
   CGLDisplayConfig(Key) {
-    // TODO: test if OpenGL 4.1 with GL_ARB_ES2_compatibility is supported
-    // If it is, use kCGLOGLPVersion_3_2_Core and enable that extension.
-    CGLPixelFormatAttribute attributes[] = {
-        kCGLPFAOpenGLProfile, static_cast<CGLPixelFormatAttribute>(kCGLOGLPVersion_Legacy),
-        // Not adding kCGLPFAAccelerated, as this will make headless rendering impossible when
-        // running in VMs.
-        kCGLPFAClosestPolicy, kCGLPFAAccumSize, static_cast<CGLPixelFormatAttribute>(32),
-        kCGLPFAColorSize, static_cast<CGLPixelFormatAttribute>(24), kCGLPFAAlphaSize,
-        static_cast<CGLPixelFormatAttribute>(8), kCGLPFADepthSize,
-        static_cast<CGLPixelFormatAttribute>(16), kCGLPFAStencilSize,
-        static_cast<CGLPixelFormatAttribute>(8), kCGLPFASupportsAutomaticGraphicsSwitching,
-        kCGLPFAAllowOfflineRenderers,  // Allows using the integrated GPU
-        static_cast<CGLPixelFormatAttribute>(0)};
+    // mbgl requires GL 3.x+ (VAO, UBO, FBO). Legacy profile causes GL_INVALID_* errors.
+    const CGLPixelFormatAttribute attrs41[] = {
+        kCGLPFAOpenGLProfile, static_cast<CGLPixelFormatAttribute>(kCGLOGLPVersion_GL4_Core),
+        kCGLPFAClosestPolicy,
+        kCGLPFAColorSize, static_cast<CGLPixelFormatAttribute>(24),
+        kCGLPFAAlphaSize, static_cast<CGLPixelFormatAttribute>(8),
+        kCGLPFADepthSize, static_cast<CGLPixelFormatAttribute>(24),
+        kCGLPFAStencilSize, static_cast<CGLPixelFormatAttribute>(8),
+        kCGLPFAAllowOfflineRenderers,
+        static_cast<CGLPixelFormatAttribute>(0),
+    };
 
-    GLint num;
-    // TODO: obtain all configurations and choose the best one.
-    const CGLError error = CGLChoosePixelFormat(attributes, &pixelFormat, &num);
-    if (error != kCGLNoError) {
-      throw std::runtime_error(std::string("Error choosing pixel format:") + CGLErrorString(error) +
-                               "\n");
-    }
-    if (num <= 0) {
-      throw std::runtime_error("No pixel formats found.");
+    const CGLPixelFormatAttribute attrs32[] = {
+        kCGLPFAOpenGLProfile, static_cast<CGLPixelFormatAttribute>(kCGLOGLPVersion_3_2_Core),
+        kCGLPFAClosestPolicy,
+        kCGLPFAColorSize, static_cast<CGLPixelFormatAttribute>(24),
+        kCGLPFAAlphaSize, static_cast<CGLPixelFormatAttribute>(8),
+        kCGLPFADepthSize, static_cast<CGLPixelFormatAttribute>(24),
+        kCGLPFAStencilSize, static_cast<CGLPixelFormatAttribute>(8),
+        kCGLPFAAllowOfflineRenderers,
+        static_cast<CGLPixelFormatAttribute>(0),
+    };
+
+    if (!choosePixelFormat(attrs41, pixelFormat) && !choosePixelFormat(attrs32, pixelFormat)) {
+      throw std::runtime_error("No suitable OpenGL Core pixel format found for headless rendering.");
     }
   }
 
@@ -78,11 +90,8 @@ public:
                                CGLErrorString(error) + "\n");
     }
 
-    error = CGLEnable(glContext, kCGLCEMPEngine);
-    if (error != kCGLNoError) {
-      throw std::runtime_error(std::string("Error enabling OpenGL multithreading:") +
-                               CGLErrorString(error) + "\n");
-    }
+    // kCGLCEMPEngine is deprecated and may fail on Core profile contexts; non-fatal.
+    CGLEnable(glContext, kCGLCEMPEngine);
   }
 
   ~CGLBackendImpl() final { CGLDestroyContext(glContext); }

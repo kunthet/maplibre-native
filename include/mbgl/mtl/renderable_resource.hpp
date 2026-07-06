@@ -20,6 +20,9 @@ public:
         // explicitly can override this method.
     }
 
+    /// Commit any pending command buffer without waiting for GPU completion.
+    virtual void commitFrame() {}
+
     virtual const mbgl::mtl::RendererBackend& getBackend() const = 0;
     virtual const mbgl::mtl::MTLCommandBufferPtr& getCommandBuffer() const = 0;
     virtual mbgl::mtl::MTLBlitPassDescriptorPtr getUploadPassDescriptor() const = 0;

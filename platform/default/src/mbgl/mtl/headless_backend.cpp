@@ -31,7 +31,13 @@ public:
     PremultipliedImage readStillImage() { return offscreenTexture->readStillImage(); }
 
     MTL::Texture* getMetalTexture() {
-        return static_cast<Texture2D*>(offscreenTexture->getTexture().get())->getMetalTexture();
+        auto* texture = static_cast<Texture2D*>(offscreenTexture->getTexture().get());
+        texture->create();
+        return texture->getMetalTexture();
+    }
+
+    void prepareForExport() {
+        offscreenTexture->getResource<RenderableResource>().commitFrame();
     }
 
     const RendererBackend& getBackend() const override { return context.getBackend(); }
@@ -92,12 +98,18 @@ void HeadlessBackend::updateAssumedState() {
 }
 
 PremultipliedImage HeadlessBackend::readStillImage() {
+    ensureResource();
     return getResource<HeadlessRenderableResource>().readStillImage();
 }
 
 MTL::Texture* HeadlessBackend::getMetalTexture() {
     ensureResource();
     return getResource<HeadlessRenderableResource>().getMetalTexture();
+}
+
+void HeadlessBackend::prepareFrameForExport() {
+    ensureResource();
+    getResource<HeadlessRenderableResource>().prepareForExport();
 }
 
 RendererBackend* HeadlessBackend::getRendererBackend() {

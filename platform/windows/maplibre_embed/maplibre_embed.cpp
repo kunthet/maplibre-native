@@ -40,8 +40,19 @@ MapEmbedHandle* map_embed_create(int width,
   auto handle = new MapEmbedHandle();
   maplibre_windows::GpuFrameCallback gpu_frame_cb;
   if (on_gpu_frame) {
-      gpu_frame_cb = [on_gpu_frame, gpu_frame_user_data](void* shared_handle, int width, int height) {
-          on_gpu_frame(gpu_frame_user_data, shared_handle, width, height);
+      gpu_frame_cb = [on_gpu_frame, gpu_frame_user_data](void* shared_handle,
+                                                         int width,
+                                                         int height,
+                                                         void* producer_event,
+                                                         void* consumer_event,
+                                                         uint64_t producer_value) {
+          on_gpu_frame(gpu_frame_user_data,
+                       shared_handle,
+                       width,
+                       height,
+                       producer_event,
+                       consumer_event,
+                       producer_value);
       };
   }
   handle->embedder = std::make_unique<maplibre_windows::MapEmbedder>(
@@ -63,6 +74,24 @@ MapEmbedHandle* map_embed_create(int width,
 int map_embed_is_gpu_mode(MapEmbedHandle* handle) {
     if (!handle || !handle->embedder) return 0;
     return handle->embedder->IsGpuMode() ? 1 : 0;
+}
+
+int map_embed_get_gpu_frame_sync(MapEmbedHandle* handle, MapEmbedGpuFrameSync* out) {
+    if (!handle || !handle->embedder || !out) {
+        return 0;
+    }
+
+    void* producer = nullptr;
+    void* consumer = nullptr;
+    uint64_t value = 0;
+    if (!handle->embedder->GetGpuFrameSync(&producer, &consumer, &value)) {
+        return 0;
+    }
+
+    out->producer_event = producer;
+    out->consumer_event = consumer;
+    out->producer_value = value;
+    return 1;
 }
 
 void map_embed_destroy(MapEmbedHandle* handle) {

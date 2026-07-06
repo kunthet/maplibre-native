@@ -1,6 +1,12 @@
 #include "map_embedder.h"
 
+#ifdef MAPLIBRE_EMBED_GPU_SURFACE
+#ifdef _WIN32
 #include "gpu_surface_d3d.h"
+#elif defined(__APPLE__)
+#include "gpu_surface_mtl.h"
+#endif
+#endif
 
 #include <mbgl/gfx/backend_scope.hpp>
 #include <mbgl/gfx/headless_frontend.hpp>
@@ -35,6 +41,7 @@
 #include <mbgl/style/style.hpp>
 #include <mbgl/util/tile_server_options.hpp>
 #include <mbgl/util/image.hpp>
+#include <mbgl/util/constants.hpp>
 #include <mbgl/util/run_loop.hpp>
 #include <mbgl/util/timer.hpp>
 
@@ -44,9 +51,8 @@
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 
-#include <algorithm>
-#include <atomic>
 #include <chrono>
+#include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
@@ -54,10 +60,30 @@
 #include <filesystem>
 #include <sstream>
 
+#ifndef NDEBUG
+static bool MapTraceEnabled() {
+    static const bool on = [] {
+        const char* v = getenv("MYURA_TRACE");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+#define MAP_TRACE(...)                                   \
+    do {                                                 \
+        if (MapTraceEnabled()) {                         \
+            fprintf(stderr, "[MapTrace] " __VA_ARGS__);  \
+            fprintf(stderr, "\n");                        \
+        }                                                \
+    } while (0)
+#else
+#define MAP_TRACE(...) do {} while (0)
+#endif
+
 namespace maplibre_windows {
 namespace {
 
 using namespace mbgl;
+
 
 std::mutex g_gl_init_mutex;
 
@@ -66,6 +92,7 @@ public:
     EmbedderObserver(std::function<void(const std::string&, const std::string&)> emit,
                      std::function<void()> request_render_until_idle,
                      std::function<void()> request_render_quick,
+                     std::function<void()> on_style_fully_loaded,
                      std::atomic<bool>* needs_repaint,
                      std::atomic<bool>* pumping_render,
                      std::atomic<bool>* pan_snapshot_active,
@@ -76,6 +103,7 @@ public:
         : emit_(std::move(emit)),
           request_render_until_idle_(std::move(request_render_until_idle)),
           request_render_quick_(std::move(request_render_quick)),
+          on_style_fully_loaded_(std::move(on_style_fully_loaded)),
           needs_repaint_(needs_repaint),
           pumping_render_(pumping_render),
           pan_snapshot_active_(pan_snapshot_active),
@@ -85,9 +113,18 @@ public:
           scroll_gesture_frozen_(scroll_gesture_frozen) {}
 
     void onDidFinishLoadingStyle() override {
+        if (on_style_fully_loaded_) {
+            on_style_fully_loaded_();
+        }
         emit_("styleLoaded", "{}");
-        if (request_render_until_idle_) {
-            request_render_until_idle_();
+        // Only request a quick render (2 frames) after style load, not a full
+        // render-until-idle. A full idle pump can block the render thread for
+        // hundreds of frames while the C# layer queues P/Invoke work (AddSource,
+        // AddLayer via InvokeSync from the styleLoaded handler chain). Those
+        // calls need the render thread's run loop to process queued work, so
+        // blocking it here would deadlock.
+        if (request_render_quick_) {
+            request_render_quick_();
         }
     }
     void onDidBecomeIdle() override { emit_("mapIdle", "{}"); }
@@ -121,6 +158,7 @@ private:
     std::function<void(const std::string&, const std::string&)> emit_;
     std::function<void()> request_render_until_idle_;
     std::function<void()> request_render_quick_;
+    std::function<void()> on_style_fully_loaded_;
     std::atomic<bool>* needs_repaint_ = nullptr;
     std::atomic<bool>* pumping_render_ = nullptr;
     std::atomic<bool>* pan_snapshot_active_ = nullptr;
@@ -221,39 +259,6 @@ void BlitPanSnapshot(const uint8_t* src,
     }
 }
 
-void DownscalePremultipliedImage(const PremultipliedImage& image,
-                                 size_t dst_width,
-                                 size_t dst_height,
-                                 std::vector<uint8_t>& dst) {
-    if (!image.valid() || dst_width == 0 || dst_height == 0) {
-        dst.clear();
-        return;
-    }
-
-    const size_t src_width = static_cast<size_t>(image.size.width);
-    const size_t src_height = static_cast<size_t>(image.size.height);
-    if (src_width == dst_width && src_height == dst_height) {
-        dst.resize(src_width * src_height * 4);
-        std::memcpy(dst.data(), image.data.get(), dst.size());
-        return;
-    }
-
-    dst.assign(dst_width * dst_height * 4, 0);
-    const uint8_t* src = image.data.get();
-    for (size_t y = 0; y < dst_height; ++y) {
-        const size_t src_y = y * src_height / dst_height;
-        for (size_t x = 0; x < dst_width; ++x) {
-            const size_t src_x = x * src_width / dst_width;
-            const size_t src_index = (src_y * src_width + src_x) * 4;
-            const size_t dst_index = (y * dst_width + x) * 4;
-            dst[dst_index + 0] = src[src_index + 0];
-            dst[dst_index + 1] = src[src_index + 1];
-            dst[dst_index + 2] = src[src_index + 2];
-            dst[dst_index + 3] = src[src_index + 3];
-        }
-    }
-}
-
 void PumpRenderFrames(HeadlessFrontend* frontend,
                       Map* map,
                       std::atomic<bool>* needs_repaint,
@@ -324,14 +329,23 @@ struct MapEmbedder::Impl {
     double pan_snapshot_origin_x = 0;
     double pan_snapshot_origin_y = 0;
     std::vector<uint8_t> composed_pixels;
+    std::vector<uint8_t> last_published_pixels;
+    size_t last_published_width = 0;
+    size_t last_published_height = 0;
     std::atomic<bool> needs_repaint{true};
     std::atomic<bool> pumping_render{false};
     std::atomic<bool> animating{false};
     std::atomic<bool> shutting_down{false};
     std::atomic<bool> cancel_idle_pump{false};
     std::atomic<bool> gpu_active{false};
+    std::optional<mbgl::CameraOptions> pending_initial_camera;
+    std::optional<mbgl::CameraOptions> camera_to_restore_after_style;
+    bool initial_camera_applied = false;
 #ifdef MAPLIBRE_EMBED_GPU_SURFACE
     std::unique_ptr<GpuSurface> gpu_surface;
+#endif
+#if defined(__APPLE__)
+    std::chrono::steady_clock::time_point last_gpu_idle_quick_render{};
 #endif
 };
 
@@ -341,6 +355,7 @@ constexpr int kQuickRenderPumpFrames = 2;
 constexpr int kInteractionFps = 60;
 constexpr int kScrollGestureDebounceMs = 150;
 constexpr int kScrollFollowUpRenderFrames = 4;
+constexpr auto kGpuIdleQuickRenderMinInterval = std::chrono::milliseconds(33);
 }  // namespace
 
 MapEmbedder::MapEmbedder(int width,
@@ -359,12 +374,40 @@ MapEmbedder::MapEmbedder(int width,
     impl_->width = width;
     impl_->height = height;
 
+#if defined(__APPLE__)
+    // See map_embedder.h: run the map thread on a pthread with a large (16 MB)
+    // stack so CoreGraphics image decoding in AddImage cannot overflow it.
+    {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, static_cast<size_t>(16) * 1024 * 1024);
+        auto trampoline = [](void* self) -> void* {
+            static_cast<MapEmbedder*>(self)->ThreadMain();
+            return nullptr;
+        };
+        thread_started_ = (pthread_create(&thread_, &attr, trampoline, this) == 0);
+        pthread_attr_destroy(&attr);
+    }
+#else
     thread_ = std::thread([this]() { ThreadMain(); });
+#endif
+
 
     std::unique_lock<std::mutex> lock(ready_mutex_);
     ready_cv_.wait(lock, [this] { return thread_ready_; });
 
     InvokeSync([&] {
+        if (init_camera) {
+            const auto options = mbgl::CameraOptions()
+                                     .withCenter(mbgl::LatLng{init_camera->lat, init_camera->lon})
+                                     .withZoom(init_camera->zoom)
+                                     .withBearing(init_camera->bearing)
+                                     .withPitch(init_camera->pitch);
+            // Apply before style load so mbgl does not jumpTo(getDefaultCamera())
+            // on onStyleLoaded (zoom 0 world view → init zoom flash).
+            impl_->map->jumpTo(options);
+            impl_->initial_camera_applied = true;
+        }
         if (!init_style.empty()) {
             const auto normalized = NormalizeStyleUrl(init_style);
             if (!normalized.empty() && (normalized.front() == '{' || normalized.front() == '[')) {
@@ -373,21 +416,17 @@ MapEmbedder::MapEmbedder(int width,
                 impl_->map->getStyle().loadURL(normalized);
             }
         }
-        if (init_camera) {
-            impl_->map->jumpTo(CameraOptions()
-                                   .withCenter(LatLng{init_camera->lat, init_camera->lon})
-                                   .withZoom(init_camera->zoom)
-                                   .withBearing(init_camera->bearing)
-                                   .withPitch(init_camera->pitch));
-        }
     });
 }
 
 void MapEmbedder::ShutdownOnRunLoop() {
     StopFrameTick();
+    impl_->frame_tick.reset();
     if (impl_->scroll_freeze_timer) {
         impl_->scroll_freeze_timer->stop();
+        impl_->scroll_freeze_timer.reset();
     }
+    ReleasePanSnapshot();
     impl_->map.reset();
     impl_->frontend.reset();
     impl_->observer.reset();
@@ -398,11 +437,18 @@ void MapEmbedder::ShutdownOnRunLoop() {
 
 MapEmbedder::~MapEmbedder() {
     impl_->shutting_down.store(true);
+#if defined(__APPLE__)
+    if (!thread_started_) {
+        return;
+    }
+#else
     if (!thread_.joinable()) {
         return;
     }
+#endif
 
     if (impl_->run_loop) {
+
         std::mutex mutex;
         std::condition_variable cv;
         bool done = false;
@@ -418,10 +464,18 @@ MapEmbedder::~MapEmbedder() {
         cv.wait(lock, [&] { return done; });
     }
 
+#if defined(__APPLE__)
+    if (thread_started_) {
+        pthread_join(thread_, nullptr);
+        thread_started_ = false;
+    }
+#else
     if (thread_.joinable()) {
         thread_.join();
     }
+#endif
 }
+
 
 void MapEmbedder::ThreadMain() {
     impl_->run_loop = std::make_unique<util::RunLoop>(util::RunLoop::Type::New);
@@ -433,6 +487,7 @@ void MapEmbedder::ThreadMain() {
         },
         [this]() { RequestRenderUntilIdle(); },
         [this]() { RequestRenderQuick(); },
+        [this]() { OnStyleFullyLoaded(); },
         &impl_->needs_repaint,
         &impl_->pumping_render,
         &impl_->pan_snapshot_active,
@@ -483,10 +538,8 @@ void MapEmbedder::ThreadMain() {
     // created), to isolate mbgl-on-ANGLE crashes from the GPU surface probe.
     bool gpu_disabled = false;
     {
-        char* value = nullptr;
-        size_t len = 0;
-        gpu_disabled = _dupenv_s(&value, &len, "MAPLIBRE_GPU_DISABLE") == 0 && value != nullptr && value[0] == '1';
-        free(value);
+        const char* value = getenv("MAPLIBRE_GPU_DISABLE");
+        gpu_disabled = (value != nullptr && value[0] == '1');
     }
     if (on_gpu_frame_ && !gpu_disabled) {
         gfx::BackendScope guard{*impl_->frontend->getBackend()};
@@ -494,7 +547,12 @@ void MapEmbedder::ThreadMain() {
         const int physical_w = static_cast<int>(static_cast<uint32_t>(size.width * pixel_ratio_));
         const int physical_h = static_cast<int>(static_cast<uint32_t>(size.height * pixel_ratio_));
         auto gpu_surface = std::make_unique<GpuSurface>();
-        if (gpu_surface->Initialize() && gpu_surface->SelfTest(physical_w, physical_h)) {
+#if defined(__APPLE__)
+        if (GpuSurfaceInitializeFromHeadlessFrontend(
+                gpu_surface.get(), impl_->frontend.get(), physical_w, physical_h)) {
+#else
+        if (gpu_surface->Initialize(nullptr) && gpu_surface->SelfTest(physical_w, physical_h)) {
+#endif
             impl_->gpu_surface = std::move(gpu_surface);
             impl_->gpu_active.store(true);
         }
@@ -508,6 +566,15 @@ void MapEmbedder::ThreadMain() {
     ready_cv_.notify_all();
 
     impl_->run_loop->run();
+
+    // ~MapEmbedder invokes ShutdownOnRunLoop on this thread before run() returns.
+    // Drain libuv so ~RunLoop can close the loop without asserting.
+    if (impl_->run_loop) {
+        impl_->run_loop->waitForEmpty();
+        for (int i = 0; i < 128; ++i) {
+            impl_->run_loop->runOnce();
+        }
+    }
     impl_->run_loop.reset();
 }
 
@@ -515,10 +582,18 @@ void MapEmbedder::InvokeSync(const std::function<void()>& fn) const {
     if (!impl_->run_loop) {
         return;
     }
+#if defined(__APPLE__)
+    if (thread_started_ && pthread_equal(pthread_self(), thread_)) {
+        fn();
+        return;
+    }
+#else
     if (std::this_thread::get_id() == thread_.get_id()) {
         fn();
         return;
     }
+#endif
+
     std::mutex mutex;
     std::condition_variable cv;
     bool done = false;
@@ -550,19 +625,38 @@ T MapEmbedder::InvokeSyncValue(const std::function<T()>& fn) const {
 
 void MapEmbedder::RequestRenderQuick() {
     if (!impl_->map || !impl_->frontend || impl_->shutting_down.load()) {
+        MAP_TRACE("RequestRenderQuick: skip (no map/frontend/shutting_down)");
         return;
     }
     if (impl_->finishing_gesture.load()) {
+        MAP_TRACE("RequestRenderQuick: skip (finishing_gesture)");
         return;
     }
     if (impl_->pan_snapshot_active.load() && impl_->pointer_down) {
+        MAP_TRACE("RequestRenderQuick: skip (pan_snapshot_active && pointer_down)");
         return;
     }
+#if defined(__APPLE__)
+    // Tile-loading repaints can schedule hundreds of quick renders per second in
+    // GPU mode while each publish waits on Metal. Throttle idle repaints to ~30 Hz.
+    if (impl_->gpu_active.load() && !impl_->interacting && !impl_->scroll_gesture_frozen &&
+        !impl_->animating.load()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (impl_->last_gpu_idle_quick_render.time_since_epoch().count() != 0 &&
+            now - impl_->last_gpu_idle_quick_render < kGpuIdleQuickRenderMinInterval) {
+            MAP_TRACE("RequestRenderQuick: skip (gpu idle throttle)");
+            return;
+        }
+        impl_->last_gpu_idle_quick_render = now;
+    }
+#endif
     // Coalesce nested/re-entrant calls (e.g. onDidFinishRenderingFrame scheduling
     // another quick render while PumpRenderFrames is still running).
     if (impl_->pumping_render.exchange(true)) {
+        MAP_TRACE("RequestRenderQuick: skip (pumping_render already true)");
         return;
     }
+
     gfx::BackendScope guard{*impl_->frontend->getBackend()};
     const int max_frames =
         (impl_->interacting || impl_->scroll_gesture_frozen) ? 1 : kQuickRenderPumpFrames;
@@ -596,22 +690,51 @@ bool MapEmbedder::IsGpuMode() const {
     return impl_->gpu_active.load();
 }
 
+bool MapEmbedder::GetGpuFrameSync(void** producer_event, void** consumer_event, uint64_t* producer_value) const {
+    if (!producer_event || !consumer_event || !producer_value) {
+        return false;
+    }
+    *producer_event = nullptr;
+    *consumer_event = nullptr;
+    *producer_value = 0;
+
+#ifdef MAPLIBRE_EMBED_GPU_SURFACE
+    if (!impl_->gpu_active.load() || !impl_->gpu_surface) {
+        return false;
+    }
+    *producer_event = impl_->gpu_surface->producer_event();
+    *consumer_event = impl_->gpu_surface->consumer_event();
+    *producer_value = impl_->gpu_surface->producer_signaled_value();
+    return *producer_event != nullptr && *consumer_event != nullptr && *producer_value != 0;
+#else
+    return false;
+#endif
+}
+
 void MapEmbedder::PublishFrame() {
     if (!impl_->frontend) {
         return;
     }
+#ifndef NDEBUG
+    {
+        static std::atomic<int> s_publish_count{0};
+        const int n = ++s_publish_count;
+        if (getenv("MYURA_TRACE")) {
+            fprintf(stderr, "[MapEmbed] PublishFrame #%d interacting=%d frozen=%d animating=%d\n",
+                    n, (int)impl_->interacting, (int)impl_->scroll_gesture_frozen,
+                    (int)impl_->animating.load());
+        }
+    }
+#endif
+
 
 #ifdef MAPLIBRE_EMBED_GPU_SURFACE
     // Diagnostic gate: MAPLIBRE_GPU_NO_PRODUCER=1 lets mbgl render but skips all
     // publish/readback work, to isolate mbgl-on-ANGLE crashes from the blit path.
     {
         static const bool skip_publish = [] {
-            char* value = nullptr;
-            size_t len = 0;
-            const bool on = _dupenv_s(&value, &len, "MAPLIBRE_GPU_NO_PRODUCER") == 0 && value != nullptr &&
-                            value[0] == '1';
-            free(value);
-            return on;
+            const char* value = getenv("MAPLIBRE_GPU_NO_PRODUCER");
+            return (value != nullptr && value[0] == '1');
         }();
         if (skip_publish) {
             return;
@@ -626,10 +749,48 @@ void MapEmbedder::PublishFrame() {
         // mbgl's own truncating cast so the blit covers the exact extent.
         const int physical_w = static_cast<int>(static_cast<uint32_t>(size.width * pixel_ratio_));
         const int physical_h = static_cast<int>(static_cast<uint32_t>(size.height * pixel_ratio_));
-        if (physical_w > 0 && physical_h > 0 && impl_->gpu_surface->Publish(physical_w, physical_h)) {
-            on_gpu_frame_(impl_->gpu_surface->shared_handle(), physical_w, physical_h);
-            return;
+        if (physical_w > 0 && physical_h > 0) {
+#if defined(__APPLE__)
+            if (GpuSurfacePublishFromHeadlessFrontend(
+                    impl_->gpu_surface.get(), physical_w, physical_h, impl_->frontend.get())) {
+                const auto surface_id = reinterpret_cast<uintptr_t>(impl_->gpu_surface->shared_handle());
+                const auto timeline = impl_->gpu_surface->producer_signaled_value();
+#ifndef NDEBUG
+                {
+                    static std::atomic<int> s_gpu_cb_count{0};
+                    const int n = ++s_gpu_cb_count;
+                    if (n == 1 || getenv("MYURA_GPU_TRACE")) {
+                        fprintf(stderr,
+                                "[MapEmbed] GpuFrameCallback #%d %dx%d iosurface=%u timeline=%llu\n",
+                                n,
+                                physical_w,
+                                physical_h,
+                                static_cast<unsigned>(surface_id),
+                                static_cast<unsigned long long>(timeline));
+                    }
+                }
+#endif
+                on_gpu_frame_(impl_->gpu_surface->shared_handle(),
+                              physical_w,
+                              physical_h,
+                              impl_->gpu_surface->producer_event(),
+                              impl_->gpu_surface->consumer_event(),
+                              impl_->gpu_surface->producer_signaled_value());
+                return;
+            }
+#else
+            if (impl_->gpu_surface->Publish(physical_w, physical_h)) {
+                on_gpu_frame_(impl_->gpu_surface->shared_handle(), physical_w, physical_h, nullptr, nullptr, 0);
+                return;
+            }
+#endif
         }
+#if defined(__APPLE__)
+        // GPU mode is active but publish was skipped (e.g. GPU queue backlogged).
+        // Do not fall through to glReadPixels — that stalls the map thread and
+        // freezes the UI while .NET ignores CPU frames anyway.
+        return;
+#endif
         // Publish failed this frame; fall through to the CPU path below.
     }
 #endif
@@ -637,7 +798,13 @@ void MapEmbedder::PublishFrame() {
     if (!on_pixels_) {
         return;
     }
-    const auto image = impl_->frontend->readStillImage();
+    PremultipliedImage image;
+    for (int attempt = 0; attempt < 3 && !image.valid(); ++attempt) {
+        if (attempt > 0) {
+            PumpRenderFrames(impl_->frontend.get(), impl_->map.get(), &impl_->needs_repaint, 1);
+        }
+        image = impl_->frontend->readStillImage();
+    }
     if (!image.valid()) {
         return;
     }
@@ -649,6 +816,16 @@ void MapEmbedder::PublishFrame() {
 void MapEmbedder::PublishPixels(const uint8_t* data, size_t width, size_t height) {
     if (!on_pixels_ || !data || width == 0 || height == 0) {
         return;
+    }
+    // Retain the last full frame so pan capture can memcpy instead of readStillImage.
+    if (!IsGpuMode() && !impl_->pan_snapshot_active.load()) {
+        const size_t byte_count = width * height * 4;
+        if (impl_->last_published_pixels.size() != byte_count) {
+            impl_->last_published_pixels.resize(byte_count);
+        }
+        std::memcpy(impl_->last_published_pixels.data(), data, byte_count);
+        impl_->last_published_width = width;
+        impl_->last_published_height = height;
     }
     on_pixels_(data, width, height);
 }
@@ -662,28 +839,45 @@ void MapEmbedder::CapturePanSnapshot(double x, double y) {
         return;
     }
 
+    const auto size = impl_->frontend->getSize();
+    const auto expected_w =
+        static_cast<size_t>(static_cast<uint32_t>(size.width * pixel_ratio_));
+    const auto expected_h =
+        static_cast<size_t>(static_cast<uint32_t>(size.height * pixel_ratio_));
+
+    if (!impl_->last_published_pixels.empty() && impl_->last_published_width == expected_w &&
+        impl_->last_published_height == expected_h) {
+        const size_t byte_count = expected_w * expected_h * 4;
+        if (impl_->pan_snapshot_pixels.size() != byte_count) {
+            impl_->pan_snapshot_pixels.resize(byte_count);
+        }
+        std::memcpy(impl_->pan_snapshot_pixels.data(),
+                    impl_->last_published_pixels.data(),
+                    byte_count);
+        impl_->pan_snapshot_width = expected_w;
+        impl_->pan_snapshot_height = expected_h;
+        impl_->pan_snapshot_active.store(true);
+        impl_->pan_frame_dirty = true;
+        return;
+    }
+
     gfx::BackendScope guard{*impl_->frontend->getBackend()};
     PremultipliedImage image = impl_->frontend->readStillImage();
     if (!image.valid() || impl_->needs_repaint.load()) {
-        PumpRenderFrames(impl_->frontend.get(), impl_->map.get(), &impl_->needs_repaint, kQuickRenderPumpFrames);
+        PumpRenderFrames(impl_->frontend.get(), impl_->map.get(), &impl_->needs_repaint, 1);
         image = impl_->frontend->readStillImage();
     }
     if (!image.valid()) {
         return;
     }
 
-    const size_t logical_w = static_cast<size_t>(std::max(impl_->width, 0));
-    const size_t logical_h = static_cast<size_t>(std::max(impl_->height, 0));
-    if (logical_w > 0 && logical_h > 0) {
-        DownscalePremultipliedImage(image, logical_w, logical_h, impl_->pan_snapshot_pixels);
-        impl_->pan_snapshot_width = logical_w;
-        impl_->pan_snapshot_height = logical_h;
-    } else {
-        impl_->pan_snapshot_width = static_cast<size_t>(image.size.width);
-        impl_->pan_snapshot_height = static_cast<size_t>(image.size.height);
-        impl_->pan_snapshot_pixels.resize(impl_->pan_snapshot_width * impl_->pan_snapshot_height * 4);
-        std::memcpy(impl_->pan_snapshot_pixels.data(), image.data.get(), impl_->pan_snapshot_pixels.size());
-    }
+    // Keep the full physical readback so pan offsets (in logical/DIP space)
+    // can be scaled by pixel_ratio in PublishPanSnapshot. Downscaling to
+    // logical size here caused 2x pan speed and end-of-gesture jumps on Retina.
+    impl_->pan_snapshot_width = static_cast<size_t>(image.size.width);
+    impl_->pan_snapshot_height = static_cast<size_t>(image.size.height);
+    impl_->pan_snapshot_pixels.resize(impl_->pan_snapshot_width * impl_->pan_snapshot_height * 4);
+    std::memcpy(impl_->pan_snapshot_pixels.data(), image.data.get(), impl_->pan_snapshot_pixels.size());
     impl_->pan_snapshot_active.store(true);
     impl_->pan_frame_dirty = true;
 }
@@ -710,8 +904,11 @@ void MapEmbedder::PublishPanSnapshot(double x, double y) {
         return;
     }
 
-    const int offset_x = static_cast<int>(std::lround(x - impl_->pan_snapshot_origin_x));
-    const int offset_y = static_cast<int>(std::lround(y - impl_->pan_snapshot_origin_y));
+    const double scale = static_cast<double>(pixel_ratio_);
+    const int offset_x =
+        static_cast<int>(std::lround((x - impl_->pan_snapshot_origin_x) * scale));
+    const int offset_y =
+        static_cast<int>(std::lround((y - impl_->pan_snapshot_origin_y) * scale));
     BlitPanSnapshot(impl_->pan_snapshot_pixels.data(),
                     impl_->pan_snapshot_width,
                     impl_->pan_snapshot_height,
@@ -770,8 +967,10 @@ void MapEmbedder::SetInteracting(bool active) {
 }
 
 void MapEmbedder::ExtendScrollGestureFreeze() {
+    MAP_TRACE("ExtendScrollGestureFreeze: enter");
     impl_->cancel_idle_pump.store(true);
     impl_->scroll_gesture_frozen = true;
+
     SyncGestureFreezeState();
 
     if (!impl_->scroll_freeze_timer) {
@@ -971,17 +1170,40 @@ void MapEmbedder::FinishPanGesture() {
         impl_->has_pending_pan_move = false;
     }
     impl_->gesture_mode = GestureMode::None;
-    impl_->finishing_gesture.store(true);
-    ClearPanSnapshot(false);
-    SetInteracting(false);
+
+    // finishing_gesture suppresses in-flight snapshot publishes (SchedulePanPublish /
+    // ProcessPendingPanFrame) while we tear down the pan snapshot. It must be reset
+    // even if ClearPanSnapshot/SetInteracting throw, otherwise every later
+    // RequestRenderQuick/SchedulePanPublish/SchedulePointerInput would early-return
+    // and the map would go permanently unresponsive to all input. Use an RAII guard.
+    struct FinishingGuard {
+        std::atomic<bool>& flag;
+        explicit FinishingGuard(std::atomic<bool>& f) : flag(f) { flag.store(true); }
+        ~FinishingGuard() { flag.store(false); }
+    };
+    {
+        FinishingGuard guard(impl_->finishing_gesture);
+        ClearPanSnapshot(false);
+        SetInteracting(false);
+    }
+
+    // The map was already moved (moveBy) during the gesture but only the stale
+    // pan snapshot was shown. Now that finishing_gesture is cleared, render the
+    // real map so the final position is actually drawn (previously this
+    // RequestRenderQuick ran while finishing_gesture was still true and was
+    // silently skipped, leaving the display stuck on the last snapshot).
     RequestRenderQuick();
-    impl_->finishing_gesture.store(false);
 }
 
+
 void MapEmbedder::ProcessFrameTick() {
+    MAP_TRACE("ProcessFrameTick: enter frozen=%d interacting=%d pdown=%d snap=%d anim=%d",
+              (int)impl_->scroll_gesture_frozen, (int)impl_->interacting, (int)impl_->pointer_down,
+              (int)impl_->pan_snapshot_active.load(), (int)impl_->animating.load());
     if (impl_->shutting_down.load()) {
         return;
     }
+
 
     if (impl_->pan_snapshot_active.load() && impl_->pointer_down &&
         impl_->gesture_mode == GestureMode::Pan) {
@@ -1015,8 +1237,11 @@ void MapEmbedder::ProcessFrameTick() {
 }
 
 void MapEmbedder::Resize(int width, int height) {
-    InvokeAsync([this, width, height] {
+    InvokeSync([this, width, height] {
         ReleasePanSnapshot();
+        impl_->last_published_pixels.clear();
+        impl_->last_published_width = 0;
+        impl_->last_published_height = 0;
         impl_->width = width;
         impl_->height = height;
         impl_->frontend->setSize(Size{static_cast<uint32_t>(width), static_cast<uint32_t>(height)});
@@ -1042,12 +1267,28 @@ std::string MapEmbedder::NormalizeStyleUrl(std::string style) const {
     return style;
 }
 
+void MapEmbedder::OnStyleFullyLoaded() {
+    if (!impl_->map) {
+        return;
+    }
+
+    if (impl_->pending_initial_camera && !impl_->initial_camera_applied) {
+        impl_->map->jumpTo(*impl_->pending_initial_camera);
+        impl_->initial_camera_applied = true;
+        impl_->pending_initial_camera.reset();
+    } else if (impl_->camera_to_restore_after_style) {
+        impl_->map->jumpTo(*impl_->camera_to_restore_after_style);
+        impl_->camera_to_restore_after_style.reset();
+    }
+}
+
 void MapEmbedder::SetStyle(std::string style) {
     InvokeAsync([this, style = std::move(style)] {
         if (!impl_->map) {
             return;
         }
         ReleasePanSnapshot();
+        impl_->camera_to_restore_after_style = impl_->map->getCameraOptions();
         const auto normalized = NormalizeStyleUrl(style);
         if (!normalized.empty() && (normalized.front() == '{' || normalized.front() == '[')) {
             impl_->map->getStyle().loadJSON(normalized);
@@ -1182,9 +1423,9 @@ void MapEmbedder::ProcessPointerOnLoop(const std::string& phase,
         if (start_pitch || start_rotate) {
             SetInteracting(true);
         } else if (start_pan) {
-            // The pan-snapshot workaround exists to avoid the CPU readback round
-            // trip during panning. With the zero-copy GPU path that round trip is
-            // gone, so we pan the real map directly (moveBy + render) instead.
+            // CPU path: capture once, then blit the snapshot during drag (no Metal
+            // render/readback per move). Pointer coords are DIP; snapshot pixels are
+            // physical (logical * pixelRatio). PublishPanSnapshot scales offsets.
             if (!IsGpuMode()) {
                 CapturePanSnapshot(x, y);
             }
@@ -1216,8 +1457,7 @@ void MapEmbedder::ProcessPointerOnLoop(const std::string& phase,
             SchedulePanPublish();
         } else {
             impl_->map->moveBy(ScreenCoordinate{dx, dy});
-            // Repaint is driven by the interaction frame tick (see ProcessFrameTick)
-            // to avoid a render storm when many move events queue on the run loop.
+            RequestRenderQuick();
         }
         return;
     }
@@ -1245,7 +1485,9 @@ void MapEmbedder::OnPointer(const std::string& phase,
                             double scroll_delta,
                             bool shift,
                             bool control) {
+    MAP_TRACE("OnPointer: phase=%s x=%.0f y=%.0f delta=%.2f", phase.c_str(), x, y, scroll_delta);
     if (phase == "down") {
+
         // pointer_down must be set before any co-located "move" events are accepted.
         {
             std::lock_guard<std::mutex> lock(impl_->input_mutex);
@@ -1332,7 +1574,7 @@ void MapEmbedder::AddSource(const std::string& id, const std::string& source_jso
             return;
         }
         impl_->map->getStyle().addSource(std::move(*source));
-        RequestRenderUntilIdle();
+        RequestRenderQuick();
     });
 }
 
@@ -1348,7 +1590,7 @@ void MapEmbedder::AddLayer(const std::string& layer_json, const std::optional<st
             return;
         }
         impl_->map->getStyle().addLayer(std::move(*layer), below_layer_id);
-        RequestRenderUntilIdle();
+        RequestRenderQuick();
     });
 }
 
@@ -1373,7 +1615,7 @@ void MapEmbedder::ApplyStyleLayers(const std::vector<std::string>& remove_ids,
             }
             style.addLayer(std::move(*layer), std::nullopt);
         }
-        RequestRenderUntilIdle();
+        RequestRenderQuick();
     });
 }
 
@@ -1383,7 +1625,7 @@ void MapEmbedder::RemoveLayer(const std::string& id) {
             return;
         }
         impl_->map->getStyle().removeLayer(id);
-        RequestRenderUntilIdle();
+        RequestRenderQuick();
     });
 }
 
@@ -1393,7 +1635,7 @@ void MapEmbedder::RemoveSource(const std::string& id) {
             return;
         }
         impl_->map->getStyle().removeSource(id);
-        RequestRenderUntilIdle();
+        RequestRenderQuick();
     });
 }
 
@@ -1411,7 +1653,7 @@ void MapEmbedder::UpdateGeoJsonSource(const std::string& id, const std::string& 
         auto geo = style::conversion::convert<GeoJSON>(doc, error);
         if (!geo) return;
         geojson->setGeoJSON(*geo);
-        RequestRenderUntilIdle();
+        RequestRenderQuick();
     });
 }
 
@@ -1427,7 +1669,7 @@ void MapEmbedder::UpdateLayerFilter(const std::string& id, const std::string& fi
         auto filter = style::conversion::convert<style::Filter>(doc, error);
         if (!filter) return;
         layer->setFilter(*filter);
-        RequestRenderUntilIdle();
+        RequestRenderQuick();
     });
 }
 
@@ -1441,7 +1683,7 @@ void MapEmbedder::UpdateVectorSourceTiles(const std::string& id, const std::vect
         auto* vector = source->as<style::VectorSource>();
         if (!vector) return;
         vector->setTiles(tiles);
-        RequestRenderUntilIdle();
+        RequestRenderQuick();
     });
 }
 
@@ -1455,7 +1697,7 @@ void MapEmbedder::AddImage(const std::string& id, const std::vector<uint8_t>& pn
         if (!image.valid()) return;
         impl_->map->getStyle().addImage(
             std::make_unique<style::Image>(id, std::move(image), 1.0f, id.find("myura-shape-") == 0 || id.find("myura-svg-") == 0));
-        RequestRenderUntilIdle();
+        RequestRenderQuick();
     });
 }
 
@@ -1465,7 +1707,7 @@ void MapEmbedder::RemoveImage(const std::string& id) {
             return;
         }
         impl_->map->getStyle().removeImage(id);
-        RequestRenderUntilIdle();
+        RequestRenderQuick();
     });
 }
 

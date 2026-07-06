@@ -223,7 +223,11 @@ gfx::Texture2D& Texture2D::setUsage(MTL::TextureUsage usage_) noexcept {
 }
 
 MTL::Texture* Texture2D::getMetalTexture() const noexcept {
-    assert(metalTexture);
+    // Return nullptr instead of asserting when no Metal texture exists yet.
+    // The headless readStillImage path calls getMetalTexture() before the
+    // texture is created during the first render pass; asserting there
+    // silently kills the render thread. Callers (offscreen_texture,
+    // render passes) already guard with hasMetalTexture().
     return metalTexture.get();
 }
 
@@ -250,7 +254,9 @@ void Texture2D::updateSamplerConfiguration() {
 }
 
 void Texture2D::bind(RenderPass& renderPass, int32_t location) {
-    assert(!textureDirty);
+    if (textureDirty) {
+        return;
+    }
 
     // Update the sampler state if it was changed after resource creation
     if (samplerStateDirty) {
@@ -281,8 +287,9 @@ void Texture2D::upload(const void* pixelData, const Size& size_) {
 }
 
 void Texture2D::uploadSubRegion(const void* pixelData, const Size& size_, uint16_t xOffset, uint16_t yOffset) noexcept {
-    assert(metalTexture.get());
-    assert(!textureDirty);
+    if (!metalTexture.get() || textureDirty) {
+        return;
+    }
 
     const MTL::Region region = MTL::Region::Make2D(xOffset, yOffset, size_.width, size_.height);
     const NS::UInteger bytesPerRow = size_.width * getPixelStride();
